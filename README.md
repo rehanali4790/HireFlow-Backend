@@ -351,7 +351,20 @@ If tables aren't created:
 PORT=3002
 ```
 
-## 📖 Resources
+## 📖 Documentation
+
+Comprehensive documentation is available in the `docs/` folder:
+
+- **[Setup Guide](./SETUP.md)** - Quick start guide
+- **[Architecture](./docs/ARCHITECTURE.md)** - System design and patterns
+- **[Database Schema](./docs/DATABASE_SCHEMA.md)** - Complete database structure
+- **[API Documentation](./docs/API_DOCUMENTATION.md)** - All API endpoints
+- **[Development Guide](./docs/DEVELOPMENT_GUIDE.md)** - How to develop features
+- **[Code Standards](./docs/CODE_STANDARDS.md)** - Coding conventions
+- **[Testing Guide](./docs/TESTING_GUIDE.md)** - How to write tests
+- **[Troubleshooting](./docs/TROUBLESHOOTING.md)** - Common issues and solutions
+
+### External Resources
 
 - [NestJS Documentation](https://docs.nestjs.com)
 - [TypeORM Documentation](https://typeorm.io)
