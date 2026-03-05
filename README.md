@@ -1,60 +1,73 @@
 # HireFlow Backend
 
-Backend API for HireFlow - AI-Powered Hiring Platform built with NestJS and TypeScript.
+Clean, production-ready NestJS backend with TypeORM for the HireFlow hiring platform.
 
-## Tech Stack
+## 🚀 Tech Stack
 
-- **Framework**: NestJS
-- **Language**: TypeScript
+- **Framework**: NestJS 10
+- **ORM**: TypeORM 0.3
 - **Database**: PostgreSQL
+- **Language**: TypeScript
 - **Email**: Nodemailer
 - **AI**: OpenAI API
+- **Architecture**: Event-driven with modular design
 
-## Project Structure
+## 📁 Project Structure
 
 ```
 src/
-├── database/           # Database connection and service
+├── database/
+│   ├── database.module.ts      # Database configuration
+│   ├── database.service.ts     # Raw query service (legacy)
+│   └── ormconfig.ts            # TypeORM configuration
 ├── modules/
-│   ├── auth/          # Authentication (login, signup, sessions)
-│   ├── jobs/          # Job postings management
-│   ├── applications/  # Application processing
-│   ├── candidates/    # Candidate management
-│   ├── tests/         # Technical tests
-│   ├── interviews/    # AI & final interviews
-│   ├── approvals/     # Approval workflows
-│   ├── analytics/     # Dashboard analytics
-│   └── email/         # Email notifications
-├── app.module.ts      # Root module
-└── main.ts            # Application entry point
+│   ├── auth/
+│   │   ├── entities/
+│   │   │   └── employer.entity.ts
+│   │   ├── auth.controller.ts
+│   │   ├── auth.service.ts
+│   │   ├── auth.guard.ts
+│   │   └── auth.module.ts
+│   ├── jobs/
+│   │   ├── entities/
+│   │   │   └── job.entity.ts
+│   │   ├── jobs.controller.ts
+│   │   ├── jobs.service.ts
+│   │   └── jobs.module.ts
+│   ├── applications/
+│   │   ├── entities/
+│   │   │   └── application.entity.ts
+│   │   └── ...
+│   ├── candidates/
+│   │   ├── entities/
+│   │   │   └── candidate.entity.ts
+│   │   └── ...
+│   ├── tests/
+│   ├── interviews/
+│   ├── email/
+│   ├── analytics/
+│   └── approvals/
+├── app.module.ts
+└── main.ts
 ```
 
-## Setup Instructions
+## 🔧 Setup
 
 ### Prerequisites
 
-- Node.js 18+ and npm
+- Node.js 18+
 - PostgreSQL 14+
-- OpenAI API key (for AI features)
-- SMTP credentials (for email)
+- npm or yarn
 
 ### Installation
 
-1. Install dependencies:
 ```bash
+# Install dependencies
 npm install
-```
 
-2. Configure environment variables:
-```bash
+# Configure environment
 cp .env.example .env
 # Edit .env with your configuration
-```
-
-3. Run database migrations:
-```bash
-# Use the migration scripts from the original project
-# Located in ../migrations/
 ```
 
 ### Environment Variables
@@ -66,6 +79,11 @@ DB_PORT=5432
 DB_NAME=hireflow_db
 DB_USER=postgres
 DB_PASSWORD=your_password
+
+# Database Sync (IMPORTANT!)
+# Set to true ONLY in development to auto-sync schema
+# NEVER use true in production!
+DB_SYNC=false
 
 # Email (SMTP)
 SMTP_HOST=smtp.gmail.com
@@ -80,107 +98,269 @@ OPENAI_API_KEY=sk-...
 
 # Application
 APP_URL=http://localhost:3000
-TOKEN_SECRET=your-secret-key
+TOKEN_SECRET=your-secret-key-change-this
 PORT=3001
 NODE_ENV=development
 ```
 
-## Running the Application
+## 🗄️ Database Setup
+
+### Option 1: Auto-Sync (Development Only)
+
+Set `DB_SYNC=true` in your `.env` file. TypeORM will automatically create/update tables based on your entities.
+
+```bash
+# Start the server - tables will be created automatically
+npm run start:dev
+```
+
+⚠️ **WARNING**: Never use `DB_SYNC=true` in production! It can cause data loss.
+
+### Option 2: Manual Migrations (Recommended for Production)
+
+```bash
+# Run existing migrations
+npm run migrate
+
+# Or use the migration scripts
+node scripts/run-migrations.js
+```
+
+## 🏃 Running the Application
 
 ### Development Mode
+
 ```bash
 npm run start:dev
 ```
 
+Server runs on: http://localhost:3001
+
 ### Production Mode
+
 ```bash
 npm run build
 npm run start:prod
 ```
 
 ### Testing
+
 ```bash
 npm run test
 npm run test:watch
 npm run test:cov
 ```
 
-## API Endpoints
+## 📚 API Endpoints
 
 ### Authentication
-- `POST /api/auth/signup` - Create new employer account
+
+- `POST /api/auth/signup` - Create employer account
 - `POST /api/auth/login` - Login
 - `POST /api/auth/logout` - Logout
 - `GET /api/auth/session` - Get current session
 
 ### Jobs
-- `GET /api/jobs` - List jobs (public: active only, authenticated: all)
+
+- `GET /api/jobs` - List jobs
 - `GET /api/jobs/:id` - Get job details
 - `POST /api/jobs` - Create job (auth required)
 - `PUT /api/jobs/:id` - Update job (auth required)
 - `DELETE /api/jobs/:id` - Delete job (auth required)
 
 ### Applications
+
 - `POST /api/applications` - Submit application
-- `GET /api/jobs/:jobId/applications` - Get applications for job
+- `GET /api/jobs/:jobId/applications` - Get applications
 - `GET /api/applications/:id` - Get application details
-- `PATCH /api/applications/:id/status` - Update application status
+- `PATCH /api/applications/:id/status` - Update status
 
-### Candidates
-- `GET /api/candidates` - List candidates (auth required)
-- `GET /api/candidates/:id` - Get candidate details
+### Health Check
 
-### Tests
-- `GET /api/tests` - List tests
-- `POST /api/tests` - Create test
-- `PUT /api/tests/:id` - Update test
-- `DELETE /api/tests/:id` - Delete test
+- `GET /api/health` - Server health status
 
-### Interviews
-- `GET /api/interviews` - List interviews
-- `POST /api/interviews` - Create interview
-- `PUT /api/interviews/:id` - Update interview
+## 🎯 Key Features
 
-### Analytics
-- `GET /api/analytics/dashboard` - Get dashboard statistics
+### TypeORM Integration
 
-### Approvals
-- `GET /api/approvals` - List pending approvals
-- `POST /api/approvals/:applicationId` - Process approval
+All database operations use TypeORM entities and repositories:
 
-## Migration from Express
+```typescript
+// Example: Creating a job
+const job = this.jobRepository.create({
+  title: 'Software Engineer',
+  employerId: employer.id,
+  // ...
+});
+await this.jobRepository.save(job);
+```
 
-This backend is a NestJS refactor of the original Express server. Key improvements:
+### Entity Relationships
 
-1. **Modular Architecture**: Code organized into feature modules
-2. **Dependency Injection**: Better testability and maintainability
-3. **Type Safety**: Full TypeScript support with decorators
-4. **Built-in Validation**: Request validation with class-validator
-5. **Scalability**: Better structure for growing applications
+Entities are properly related:
 
-## TODO
+- `Employer` → `Job` (One-to-Many)
+- `Job` → `Application` (One-to-Many)
+- `Candidate` → `Application` (One-to-Many)
 
-The following features need to be migrated from the original Express server:
+### Event-Driven Architecture
 
-- [ ] Complete all controller endpoints
-- [ ] Implement email service methods
-- [ ] Add AI resume parsing
-- [ ] Add AI test generation
-- [ ] Add AI interview functionality
-- [ ] Implement bulk upload
-- [ ] Add file storage integration
-- [ ] Add comprehensive error handling
-- [ ] Add request validation DTOs
-- [ ] Add API documentation (Swagger)
-- [ ] Add unit and e2e tests
+Uses NestJS EventEmitter for cross-module communication:
 
-## Development Notes
+```typescript
+@OnEvent('application.created')
+handleApplicationCreated(payload: ApplicationCreatedEvent) {
+  // Send email, update analytics, etc.
+}
+```
 
-- All database queries use the centralized `DatabaseService`
-- Authentication uses token-based auth with `AuthGuard`
-- Email templates are stored in the database
-- AI features require OpenAI API key
+### Validation
 
-## License
+Automatic request validation using class-validator:
+
+```typescript
+export class CreateJobDto {
+  @IsString()
+  @IsNotEmpty()
+  title: string;
+
+  @IsEmail()
+  contactEmail: string;
+}
+```
+
+## 🔒 Security
+
+- Password hashing with SHA-256
+- Token-based authentication
+- Auth guards for protected routes
+- Input validation on all endpoints
+- SQL injection protection (TypeORM)
+
+## 📊 Database Schema
+
+### Main Tables
+
+- `employers` - Company accounts
+- `jobs` - Job postings
+- `candidates` - Candidate profiles
+- `applications` - Job applications
+- `tests` - Technical assessments
+- `ai_interviews` - AI interview records
+- `final_interviews` - Human interview scheduling
+- `email_logs` - Email tracking
+- `approval_gates` - Workflow approvals
+
+## 🚀 Deployment
+
+### Environment Setup
+
+1. Set `NODE_ENV=production`
+2. Set `DB_SYNC=false` (CRITICAL!)
+3. Use strong `TOKEN_SECRET`
+4. Configure production database
+5. Set up SSL for database connection
+
+### Recommended Platforms
+
+- **Railway**: Easy PostgreSQL + Node.js deployment
+- **Heroku**: PostgreSQL addon available
+- **AWS/DigitalOcean**: Full control
+- **Render**: Free tier available
+
+### Deployment Steps
+
+```bash
+# Build
+npm run build
+
+# Start production server
+npm run start:prod
+```
+
+## 🔄 Migration from Old Code
+
+The backend has been refactored from raw SQL queries to TypeORM:
+
+**Before (Raw SQL)**:
+```typescript
+const result = await this.db.query(
+  'SELECT * FROM jobs WHERE id = $1',
+  [id]
+);
+```
+
+**After (TypeORM)**:
+```typescript
+const job = await this.jobRepository.findOne({
+  where: { id },
+  relations: ['employer'],
+});
+```
+
+### Benefits
+
+- Type-safe database operations
+- Automatic query building
+- Easy relationship management
+- Migration support
+- Better testability
+
+## 📝 Development Notes
+
+### Adding New Entities
+
+1. Create entity file in `modules/[module]/entities/`
+2. Add entity to module's `TypeOrmModule.forFeature([])`
+3. Inject repository in service
+4. Use repository methods for CRUD operations
+
+### Database Sync Toggle
+
+The `DB_SYNC` environment variable controls schema synchronization:
+
+- `DB_SYNC=true`: Auto-sync schema (development only)
+- `DB_SYNC=false`: Manual migrations (production)
+
+This allows easy development while maintaining production safety.
+
+## 🐛 Troubleshooting
+
+### Database Connection Issues
+
+```bash
+# Check PostgreSQL is running
+psql -U postgres -l
+
+# Test connection
+psql -U postgres -d hireflow_db
+```
+
+### TypeORM Sync Issues
+
+If tables aren't created:
+1. Check `DB_SYNC=true` in `.env`
+2. Verify database credentials
+3. Check entity decorators are correct
+4. Look for TypeORM logs in console
+
+### Port Already in Use
+
+```bash
+# Change port in .env
+PORT=3002
+```
+
+## 📖 Resources
+
+- [NestJS Documentation](https://docs.nestjs.com)
+- [TypeORM Documentation](https://typeorm.io)
+- [PostgreSQL Documentation](https://www.postgresql.org/docs)
+
+## 📄 License
 
 MIT
+
+---
+
+**Built with ❤️ using NestJS and TypeORM**

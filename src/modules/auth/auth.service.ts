@@ -1,12 +1,15 @@
 import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { DatabaseService } from '../../database/database.service';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Repository } from 'typeorm';
+import { Employer } from './entities/employer.entity';
 import * as crypto from 'crypto';
 
 @Injectable()
 export class AuthService {
   constructor(
-    private db: DatabaseService,
+    @InjectRepository(Employer)
+    private employerRepository: Repository<Employer>,
     private config: ConfigService,
   ) {}
 
@@ -23,60 +26,57 @@ export class AuthService {
   }
 
   async signup(email: string, password: string, companyName: string) {
-    const existing = await this.db.query(
-      'SELECT id FROM employers WHERE contact_email = $1',
-      [email],
-    );
+    const existing = await this.employerRepository.findOne({
+      where: { contactEmail: email },
+    });
 
-    if (existing.rows.length > 0) {
+    if (existing) {
       throw new Error('An account with this email already exists');
     }
 
     const passwordHash = this.hashPassword(password);
     const token = this.generateToken();
 
-    const result = await this.db.query(
-      `INSERT INTO employers (company_name, contact_email, password_hash, auth_token, user_id)
-       VALUES ($1, $2, $3, $4, gen_random_uuid()) RETURNING id, company_name, contact_email`,
-      [companyName, email, passwordHash, token],
-    );
+    const employer = this.employerRepository.create({
+      companyName,
+      contactEmail: email,
+      passwordHash,
+      authToken: token,
+    });
 
-    return { employer: result.rows[0], token };
+    const saved = await this.employerRepository.save(employer);
+    const { passwordHash: _, authToken: __, ...safe } = saved;
+
+    return { employer: safe, token };
   }
 
   async login(email: string, password: string) {
     const passwordHash = this.hashPassword(password);
-    const result = await this.db.query(
-      'SELECT id, company_name, contact_email FROM employers WHERE contact_email = $1 AND password_hash = $2',
-      [email, passwordHash],
-    );
+    const employer = await this.employerRepository.findOne({
+      where: { contactEmail: email, passwordHash },
+    });
 
-    if (result.rows.length === 0) {
+    if (!employer) {
       throw new Error('Invalid email or password');
     }
 
     const token = this.generateToken();
-    await this.db.query('UPDATE employers SET auth_token = $1 WHERE id = $2', [
-      token,
-      result.rows[0].id,
-    ]);
+    employer.authToken = token;
+    await this.employerRepository.save(employer);
 
-    return { employer: result.rows[0], token };
+    const { passwordHash: _, authToken: __, ...safe } = employer;
+    return { employer: safe, token };
   }
 
   async logout(employerId: string) {
-    await this.db.query('UPDATE employers SET auth_token = NULL WHERE id = $1', [
-      employerId,
-    ]);
+    await this.employerRepository.update(employerId, { authToken: null });
     return { success: true };
   }
 
   async getEmployerByToken(token: string) {
-    const result = await this.db.query(
-      'SELECT * FROM employers WHERE auth_token = $1',
-      [token],
-    );
-    return result.rows[0] || null;
+    return await this.employerRepository.findOne({
+      where: { authToken: token },
+    });
   }
 
   async getSession(token: string) {
@@ -84,7 +84,7 @@ export class AuthService {
     if (!employer) {
       throw new Error('Not authenticated');
     }
-    const { password_hash, auth_token, ...safe } = employer;
+    const { passwordHash, authToken, ...safe } = employer;
     return { employer: safe };
   }
 }
