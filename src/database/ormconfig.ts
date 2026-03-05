@@ -1,6 +1,10 @@
 // src/database/ormconfig.ts
 import { TypeOrmModuleOptions } from '@nestjs/typeorm';
 import * as dotenv from 'dotenv';
+import { Employer } from '../modules/auth/entities/employer.entity';
+import { Job } from '../modules/jobs/entities/job.entity';
+import { Application } from '../modules/applications/entities/application.entity';
+import { Candidate } from '../modules/candidates/entities/candidate.entity';
 
 dotenv.config();
 
@@ -12,8 +16,8 @@ const config: TypeOrmModuleOptions = {
   password: process.env.DB_PASSWORD,
   database: process.env.DB_NAME || 'hireflow_db',
   
-  // Auto-load all entities from modules
-  autoLoadEntities: true,
+  // Explicitly list all entities
+  entities: [Employer, Job, Application, Candidate],
   
   // Enable synchronize based on DB_SYNC environment variable
   // WARNING: This will auto-create/update tables based on entities
