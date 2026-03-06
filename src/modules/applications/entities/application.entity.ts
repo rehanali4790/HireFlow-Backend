@@ -7,10 +7,10 @@ export class Application {
   @PrimaryGeneratedColumn('uuid')
   id: string;
 
-  @Column({ type: 'uuid', name: 'job_id' })
+  @Column({ type: 'uuid', name: 'job_id', nullable: true })
   jobId: string;
 
-  @Column({ type: 'uuid', name: 'candidate_id' })
+  @Column({ type: 'uuid', name: 'candidate_id', nullable: true })
   candidateId: string;
 
   @Column({ default: 'applied' })

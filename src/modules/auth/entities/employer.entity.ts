@@ -9,7 +9,7 @@ export class Employer {
   @Column({ type: 'uuid', name: 'user_id', nullable: true })
   userId: string;
 
-  @Column({ name: 'company_name' })
+  @Column({ name: 'company_name', nullable: true })
   companyName: string;
 
   @Column({ name: 'company_description', type: 'text', nullable: true })
@@ -18,7 +18,7 @@ export class Employer {
   @Column({ name: 'company_logo_url', nullable: true })
   companyLogoUrl: string;
 
-  @Column({ name: 'contact_email', unique: true })
+  @Column({ name: 'contact_email', unique: true, nullable: true })
   contactEmail: string;
 
   @Column({ name: 'contact_phone', nullable: true })
@@ -33,7 +33,7 @@ export class Employer {
   @Column({ nullable: true })
   website: string;
 
-  @Column({ name: 'password_hash' })
+  @Column({ name: 'password_hash', nullable: true })
   passwordHash: string;
 
   @Column({ name: 'auth_token', nullable: true })

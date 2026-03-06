@@ -7,13 +7,13 @@ export class Job {
   @PrimaryGeneratedColumn('uuid')
   id: string;
 
-  @Column({ type: 'uuid', name: 'employer_id' })
+  @Column({ type: 'uuid', name: 'employer_id', nullable: true })
   employerId: string;
 
-  @Column()
+  @Column({ nullable: true })
   title: string;
 
-  @Column({ type: 'text' })
+  @Column({ type: 'text', nullable: true })
   description: string;
 
   @Column({ type: 'text', nullable: true })
