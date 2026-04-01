@@ -331,12 +331,18 @@ router.patch('/:id/status', authMiddleware, async (req, res) => {
 router.post('/:id/approve', authMiddleware, async (req, res) => {
   const db = req.app.locals.db;
   const { gateName, approved, notes } = req.body;
+  const emailService = require('../services/email-service');
   
   try {
-    // Check if application belongs to employer's job
+    // Check if application belongs to employer's job and get full details
     const appResult = await db.query(
-      `SELECT a.*, a.status as current_status FROM applications a
+      `SELECT a.*, a.status as current_status,
+              c.email as candidate_email, c.first_name, c.last_name,
+              j.title as job_title, e.company_name
+       FROM applications a
+       LEFT JOIN candidates c ON a.candidate_id = c.id
        LEFT JOIN jobs j ON a.job_id = j.id
+       LEFT JOIN employers e ON j.employer_id = e.id
        WHERE a.id = $1 AND j.employer_id = $2`,
       [req.params.id, req.employerId]
     );
@@ -346,20 +352,25 @@ router.post('/:id/approve', authMiddleware, async (req, res) => {
     }
     
     const application = appResult.rows[0];
+    const candidateName = `${application.first_name} ${application.last_name}`;
     
     // Determine new status based on gate and approval
     let newStatus = application.current_status;
     let stageField = null;
+    let nextSteps = 'further evaluation';
     
     if (gateName === 'shortlist') {
       newStatus = approved ? 'shortlisted' : 'rejected_screening';
       stageField = 'shortlist_approved_at';
+      nextSteps = 'assessment test';
     } else if (gateName === 'test_review') {
       newStatus = approved ? 'ai_interview' : 'rejected_test';
       stageField = 'test_approved_at';
+      nextSteps = 'AI interview';
     } else if (gateName === 'final_interview') {
       newStatus = approved ? 'final_interview' : 'rejected_ai_interview';
       stageField = 'ai_interview_approved_at';
+      nextSteps = 'final interview';
     }
     
     // Update application
@@ -385,6 +396,28 @@ router.post('/:id/approve', authMiddleware, async (req, res) => {
       [req.params.id, gateName, approved, req.employerId, notes,
        application.current_status, newStatus]
     );
+    
+    // Send email notification (async, don't wait)
+    if (approved) {
+      emailService.sendShortlistEmail(
+        application.candidate_email,
+        candidateName,
+        application.job_title,
+        application.company_name || 'HireFlow',
+        nextSteps
+      ).catch(err => {
+        console.error('❌ Error sending shortlist email:', err);
+      });
+    } else {
+      emailService.sendRejectionEmail(
+        application.candidate_email,
+        candidateName,
+        application.job_title,
+        application.company_name || 'HireFlow'
+      ).catch(err => {
+        console.error('❌ Error sending rejection email:', err);
+      });
+    }
     
     res.json(result.rows[0]);
   } catch (error) {

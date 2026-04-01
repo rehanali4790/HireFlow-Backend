@@ -407,13 +407,26 @@ router.post('/send-invitation', authMiddleware, async (req, res) => {
     // Generate test link
     const testLink = `${process.env.APP_URL}/test/${test.id}?application=${applicationId}`;
     
-    // Send email
+    // Parse questions to get count
+    const questions = typeof test.questions === 'string' ? JSON.parse(test.questions) : test.questions || [];
+    
+    // Send email with actual test details from database (set by HR)
     const emailService = require('../services/email-service');
     await emailService.sendTestInvitation(
       application.email,
       `${application.first_name} ${application.last_name}`,
       application.job_title,
-      testLink
+      testLink,
+      {
+        duration: test.duration_minutes,
+        questionCount: questions.length,
+        passingScore: test.passing_score,
+        expiryDays: 7,
+        testType: test.test_type === 'technical' ? 'Technical Assessment (MCQs)' : 
+                  test.test_type === 'coding' ? 'Coding Challenge' :
+                  test.test_type === 'behavioral' ? 'Behavioral Assessment' :
+                  'Multiple Choice Questions (MCQs)'
+      }
     );
     
     // Update application status
