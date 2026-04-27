@@ -47,6 +47,8 @@ app.use('/api/applications', require('./routes/applications'));
 app.use('/api/candidates', require('./routes/candidates'));
 app.use('/api/tests', require('./routes/tests'));
 app.use('/api/interviews', require('./routes/interviews'));
+app.use('/api/ai-interviews', require('./routes/ai-interviews'));
+app.use('/api/ai-speech', require('./routes/ai-speech'));
 app.use('/api/analytics', require('./routes/analytics'));
 app.use('/api/email-templates', require('./routes/email-templates'));
 app.use('/api/bulk-upload', require('./routes/bulk-upload'));
