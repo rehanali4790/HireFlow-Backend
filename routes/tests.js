@@ -404,6 +404,49 @@ router.post('/send-invitation', authMiddleware, async (req, res) => {
     
     const test = testResult.rows[0];
     
+    // Check if test attempt already exists
+    const existingAttempt = await db.query(
+      `SELECT * FROM test_attempts 
+       WHERE application_id = $1 AND test_id = $2`,
+      [applicationId, test.id]
+    );
+    
+    let testAttempt;
+    if (existingAttempt.rows.length > 0) {
+      testAttempt = existingAttempt.rows[0];
+      
+      // Check if link has expired
+      const now = new Date();
+      const expiresAt = new Date(testAttempt.link_expires_at);
+      
+      if (now > expiresAt && !testAttempt.submitted_at) {
+        // Link expired and test not submitted - update expiration
+        await db.query(
+          `UPDATE test_attempts 
+           SET is_expired = true, updated_at = NOW()
+           WHERE id = $1`,
+          [testAttempt.id]
+        );
+        
+        return res.status(400).json({ 
+          error: 'Test link has expired. Please contact HR to request an extension.',
+          expired: true
+        });
+      }
+    } else {
+      // Create new test attempt with 24-hour expiration
+      const attemptResult = await db.query(
+        `INSERT INTO test_attempts (
+          application_id, test_id, 
+          link_sent_at, link_expires_at, 
+          created_at
+        ) VALUES ($1, $2, NOW(), NOW() + INTERVAL '24 hours', NOW())
+        RETURNING *`,
+        [applicationId, test.id]
+      );
+      testAttempt = attemptResult.rows[0];
+    }
+    
     // Generate test link
     const testLink = `${process.env.APP_URL}/test/${test.id}?application=${applicationId}`;
     
@@ -421,7 +464,7 @@ router.post('/send-invitation', authMiddleware, async (req, res) => {
         duration: test.duration_minutes,
         questionCount: questions.length,
         passingScore: test.passing_score,
-        expiryDays: 7,
+        expiryDays: 1, // Changed to 1 day (24 hours)
         testType: test.test_type === 'technical' ? 'Technical Assessment (MCQs)' : 
                   test.test_type === 'coding' ? 'Coding Challenge' :
                   test.test_type === 'behavioral' ? 'Behavioral Assessment' :
@@ -440,11 +483,150 @@ router.post('/send-invitation', authMiddleware, async (req, res) => {
     res.json({
       success: true,
       message: 'Test invitation sent successfully',
-      testLink
+      testLink,
+      expiresAt: testAttempt.link_expires_at
     });
   } catch (error) {
     console.error('Send test invitation error:', error);
     res.status(500).json({ error: error.message || 'Failed to send test invitation' });
+  }
+});
+
+// Check if test link is expired (public - for candidates)
+router.get('/check-expiration/:testId', async (req, res) => {
+  const db = req.app.locals.db;
+  const { testId } = req.params;
+  const { application } = req.query;
+  
+  try {
+    if (!application) {
+      return res.status(400).json({ error: 'Application ID is required' });
+    }
+    
+    // Get test attempt
+    const attemptResult = await db.query(
+      `SELECT * FROM test_attempts 
+       WHERE application_id = $1 AND test_id = $2`,
+      [application, testId]
+    );
+    
+    if (attemptResult.rows.length === 0) {
+      // No attempt yet - link is valid
+      return res.json({ expired: false, valid: true });
+    }
+    
+    const attempt = attemptResult.rows[0];
+    
+    // Check if already submitted
+    if (attempt.submitted_at) {
+      return res.json({ 
+        expired: false, 
+        valid: true,
+        submitted: true,
+        message: 'Test already submitted'
+      });
+    }
+    
+    // Check expiration
+    const now = new Date();
+    const expiresAt = new Date(attempt.link_expires_at);
+    
+    if (now > expiresAt) {
+      // Update expiration status
+      await db.query(
+        `UPDATE test_attempts 
+         SET is_expired = true, updated_at = NOW()
+         WHERE id = $1`,
+        [attempt.id]
+      );
+      
+      return res.status(403).json({ 
+        expired: true,
+        message: 'This test link has expired after 24 hours. Please contact HR to request an extension.',
+        expiresAt: attempt.link_expires_at
+      });
+    }
+    
+    // Link is still valid
+    res.json({ 
+      expired: false, 
+      valid: true,
+      expiresAt: attempt.link_expires_at,
+      timeRemaining: Math.floor((expiresAt - now) / 1000 / 60) // minutes
+    });
+    
+  } catch (error) {
+    console.error('Check expiration error:', error);
+    res.status(500).json({ error: 'Failed to check test expiration' });
+  }
+});
+
+// Extend test link expiration (authenticated - HR only)
+router.post('/extend-link/:applicationId', authMiddleware, async (req, res) => {
+  const db = req.app.locals.db;
+  const { applicationId } = req.params;
+  const { reason, extensionHours } = req.body;
+  
+  try {
+    // Verify application belongs to employer
+    const appCheck = await db.query(
+      `SELECT a.*, j.employer_id 
+       FROM applications a
+       LEFT JOIN jobs j ON a.job_id = j.id
+       WHERE a.id = $1 AND j.employer_id = $2`,
+      [applicationId, req.employerId]
+    );
+    
+    if (appCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Application not found' });
+    }
+    
+    // Get test attempt
+    const attemptResult = await db.query(
+      `SELECT ta.*, t.id as test_id
+       FROM test_attempts ta
+       LEFT JOIN tests t ON ta.test_id = t.id
+       WHERE ta.application_id = $1`,
+      [applicationId]
+    );
+    
+    if (attemptResult.rows.length === 0) {
+      return res.status(404).json({ error: 'No test attempt found for this application' });
+    }
+    
+    const attempt = attemptResult.rows[0];
+    
+    // Check if test already submitted
+    if (attempt.submitted_at) {
+      return res.status(400).json({ error: 'Test has already been submitted' });
+    }
+    
+    // Extend the link (default 24 hours if not specified)
+    const hours = extensionHours || 24;
+    const newExpiresAt = new Date();
+    newExpiresAt.setHours(newExpiresAt.getHours() + hours);
+    
+    await db.query(
+      `UPDATE test_attempts 
+       SET link_expires_at = $1,
+           link_extended_at = NOW(),
+           extension_reason = $2,
+           is_expired = false,
+           updated_at = NOW()
+       WHERE id = $3`,
+      [newExpiresAt, reason || 'Extended by HR', attempt.id]
+    );
+    
+    console.log(`✅ Test link extended for application ${applicationId} until ${newExpiresAt}`);
+    
+    res.json({
+      success: true,
+      message: `Test link extended by ${hours} hours`,
+      newExpiresAt
+    });
+  } catch (error) {
+    console.error('Extend test link error:', error);
+    res.status(500).json({ error: 'Failed to extend test link' });
   }
 });
 

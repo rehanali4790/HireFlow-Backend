@@ -186,8 +186,8 @@ async function sendTestInvitation(candidateEmail, candidateName, jobTitle, testL
 /**
  * Send AI interview invitation
  */
-async function sendInterviewInvitation(candidateEmail, candidateName, jobTitle, interviewLink) {
-  const subject = `AI Interview Invitation - ${jobTitle}`;
+async function sendAIInterviewInvitation(candidateEmail, candidateName, jobTitle, interviewLink) {
+  const subject = `🎤 AI Interview Invitation - ${jobTitle}`;
   const html = `
     <!DOCTYPE html>
     <html>
@@ -195,35 +195,90 @@ async function sendInterviewInvitation(candidateEmail, candidateName, jobTitle, 
       <style>
         body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
         .container { max-width: 600px; margin: 0 auto; padding: 20px; }
-        .header { background: #4F46E5; color: white; padding: 20px; text-align: center; }
-        .content { padding: 20px; background: #f9f9f9; }
-        .button { display: inline-block; padding: 12px 24px; background: #4F46E5; color: white; text-decoration: none; border-radius: 5px; margin: 20px 0; }
+        .header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 30px; text-align: center; }
+        .content { padding: 30px; background: #f9f9f9; }
+        .interview-details { background: white; padding: 20px; border-radius: 8px; margin: 20px 0; border: 2px solid #667eea; }
+        .detail-row { display: flex; justify-content: space-between; padding: 10px 0; border-bottom: 1px solid #E5E7EB; }
+        .detail-label { font-weight: bold; color: #667eea; }
+        .button { display: inline-block; padding: 15px 40px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; text-decoration: none; border-radius: 8px; margin: 20px 0; font-weight: bold; font-size: 16px; }
+        .warning { background: #FEF3C7; padding: 15px; border-left: 4px solid #F59E0B; margin: 20px 0; }
+        .tips { background: #DBEAFE; padding: 15px; border-left: 4px solid #3B82F6; margin: 20px 0; }
         .footer { padding: 20px; text-align: center; font-size: 12px; color: #666; }
       </style>
     </head>
     <body>
       <div class="container">
         <div class="header">
-          <h1>AI Interview Invitation</h1>
+          <h1>🎤 AI Interview Invitation</h1>
+          <p style="margin: 10px 0 0 0; font-size: 18px;">You're one step closer!</p>
         </div>
         <div class="content">
           <p>Dear ${candidateName},</p>
-          <p>Great news! You have been invited to participate in an AI-powered interview for the <strong>${jobTitle}</strong> position.</p>
-          <p>This interview will be conducted by our AI interviewer and will take approximately 15-20 minutes.</p>
-          <p>Please click the button below to start your interview:</p>
+          <p>Congratulations! You have been selected to participate in an AI-powered interview for the <strong>${jobTitle}</strong> position.</p>
+          
+          <div class="interview-details">
+            <h3 style="margin-top: 0; color: #667eea;">Interview Details</h3>
+            <div class="detail-row">
+              <span class="detail-label">Format:</span>
+              <span>AI-Powered Voice Interview</span>
+            </div>
+            <div class="detail-row">
+              <span class="detail-label">Duration:</span>
+              <span>15-20 minutes</span>
+            </div>
+            <div class="detail-row">
+              <span class="detail-label">Questions:</span>
+              <span>8-10 questions based on your resume and job requirements</span>
+            </div>
+            <div class="detail-row" style="border-bottom: none;">
+              <span class="detail-label">Technology:</span>
+              <span>Voice-based (microphone required)</span>
+            </div>
+          </div>
+          
+          <div class="warning">
+            <strong>⚠️ Technical Requirements:</strong>
+            <ul style="margin: 10px 0;">
+              <li><strong>Microphone:</strong> Required for voice responses</li>
+              <li><strong>Camera:</strong> Recommended (optional)</li>
+              <li><strong>Browser:</strong> Chrome or Edge (latest version)</li>
+              <li><strong>Internet:</strong> Stable connection required</li>
+            </ul>
+          </div>
+          
           <p style="text-align: center;">
-            <a href="${interviewLink}" class="button">Start Interview</a>
+            <a href="${interviewLink}" class="button">Start AI Interview</a>
           </p>
-          <p>Tips for success:</p>
-          <ul>
-            <li>Find a quiet place with good internet connection</li>
-            <li>Be prepared to answer questions about your experience</li>
-            <li>Speak clearly and provide specific examples</li>
-          </ul>
-          <p>Good luck!</p>
+          
+          <div class="tips">
+            <strong>💡 Tips for Success:</strong>
+            <ul style="margin: 10px 0;">
+              <li><strong>Environment:</strong> Find a quiet place without background noise</li>
+              <li><strong>Preparation:</strong> Review your resume and the job description</li>
+              <li><strong>Communication:</strong> Speak clearly and provide specific examples</li>
+              <li><strong>Honesty:</strong> Be genuine - the AI evaluates authenticity</li>
+              <li><strong>Details:</strong> Provide concrete examples from your experience</li>
+            </ul>
+          </div>
+          
+          <h3>How It Works:</h3>
+          <ol>
+            <li>Click the "Start AI Interview" button above</li>
+            <li>Grant microphone (and camera) permissions</li>
+            <li>The AI interviewer will welcome you and ask questions</li>
+            <li>Listen to each question and respond naturally</li>
+            <li>The interview will automatically end after all questions</li>
+          </ol>
+          
+          <p><strong>Note:</strong> The AI will ask questions based 60% on your resume and 40% on the job requirements, ensuring a personalized interview experience.</p>
+          
+          <p>Good luck! We're excited to learn more about you.</p>
+          
+          <p>Best regards,<br>The Hiring Team</p>
         </div>
         <div class="footer">
           <p>This is an automated message from HireFlow ATS</p>
+          <p>If you experience technical issues, please contact support immediately.</p>
         </div>
       </div>
     </body>
@@ -231,6 +286,11 @@ async function sendInterviewInvitation(candidateEmail, candidateName, jobTitle, 
   `;
   
   return sendEmail(candidateEmail, subject, html);
+}
+
+// Alias for backward compatibility
+async function sendInterviewInvitation(candidateEmail, candidateName, jobTitle, interviewLink) {
+  return sendAIInterviewInvitation(candidateEmail, candidateName, jobTitle, interviewLink);
 }
 
 /**
@@ -326,6 +386,7 @@ module.exports = {
   sendEmail,
   sendApplicationConfirmation,
   sendTestInvitation,
+  sendAIInterviewInvitation,
   sendInterviewInvitation,
   sendShortlistEmail,
   sendRejectionEmail,

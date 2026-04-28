@@ -168,10 +168,13 @@ IMPORTANT NOTES:
  * Generate AI interview question
  */
 async function generateInterviewQuestion(jobDescription, jobRequirements, transcript, questionNumber) {
+  // Build conversation history for OpenAI
   const conversationHistory = transcript.map(entry => ({
     role: entry.role === 'ai' ? 'assistant' : 'user',
     content: entry.message
   }));
+
+  console.log(`📝 Building question ${questionNumber} with ${conversationHistory.length} messages in history`);
 
   // Check if interview should end
   if (questionNumber >= 4) {
@@ -242,36 +245,41 @@ Respond ONLY with JSON:
     }
   }
 
-  // Generate next question
+  // Generate next question with full context
   const systemPrompt = `You are a Senior Technical Interviewer conducting a professional technical interview. Act like a real person having a conversation, not a robot.
 
 Your interviewing style:
 - Ask questions naturally, like a real interview conversation
+- NEVER repeat questions you've already asked - review the conversation history carefully
 - Listen to what they say and respond accordingly - don't repeat back what they just told you
 - If an answer is vague, ask ONE specific follow-up question to dig deeper
 - Move the conversation forward - don't get stuck on one topic
 - Be direct but conversational
+- Each question should explore NEW territory based on what you've already learned
 
 Job Description: ${jobDescription}
 Job Requirements: ${JSON.stringify(jobRequirements)}
 
-Question ${questionNumber} - ${
+This is Question ${questionNumber}:
+${
   questionNumber === 1 
-    ? 'Start conversationally. Ask about their background and relevant experience.'
+    ? 'Start conversationally. Ask about their background and relevant experience for THIS specific role.'
     : questionNumber === 2
-    ? 'Based on their answer, dig into one specific area they mentioned.'
+    ? 'Based on their answer, dig into ONE specific area they mentioned. Ask for concrete examples or details.'
     : questionNumber <= 5
-    ? 'Ask a technical question about core job requirements.'
+    ? 'Ask a technical question about core job requirements that you HAVEN\'T covered yet. Focus on skills needed for this role.'
     : questionNumber <= 8
-    ? 'Present a realistic scenario or problem they might face in this role.'
-    : 'Final questions - test depth, decision-making, or anything they seem weak on.'
+    ? 'Present a realistic scenario or problem they might face in this role. Make it specific and practical.'
+    : 'Final questions - test depth, decision-making, or explore any areas you haven\'t covered yet.'
 }
 
-IMPORTANT:
-- Ask ONE clear question
-- Respond naturally to what they said
-- Keep the conversation flowing
-- Sound like a human interviewer`;
+CRITICAL RULES:
+1. Review the conversation history - DO NOT ask about topics already covered
+2. Each question should explore NEW information
+3. Build on previous answers naturally
+4. Ask ONE clear, focused question
+5. Keep questions conversational and professional
+6. Avoid generic questions - make them specific to this role and their background`;
 
   const response = await openai.chat.completions.create({
     model: 'gpt-4o-mini',
@@ -279,11 +287,16 @@ IMPORTANT:
       { role: 'system', content: systemPrompt },
       ...conversationHistory,
     ],
-    temperature: 0.8,
+    temperature: 0.9, // Increased for more variety
     max_tokens: 300,
+    presence_penalty: 0.6, // Penalize repetition
+    frequency_penalty: 0.6, // Penalize repetition
   });
 
-  return { question: response.choices[0].message.content };
+  const generatedQuestion = response.choices[0].message.content;
+  console.log(`✅ Generated unique question ${questionNumber}`);
+  
+  return { question: generatedQuestion };
 }
 
 /**
