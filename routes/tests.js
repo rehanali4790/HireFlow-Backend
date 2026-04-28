@@ -210,15 +210,40 @@ router.post('/:id/submit', async (req, res) => {
     const percentage = maxScore > 0 ? (score / maxScore) * 100 : 0;
     const passed = percentage >= test.passing_score;
     
-    // Save test attempt
-    const attemptResult = await db.query(
-      `INSERT INTO test_attempts (
-        application_id, test_id, started_at, submitted_at,
-        answers, score, max_score, percentage, passed, created_at
-      ) VALUES ($1, $2, NOW(), NOW(), $3, $4, $5, $6, $7, NOW())
-      RETURNING *`,
-      [applicationId, req.params.id, JSON.stringify(answers), score, maxScore, percentage, passed]
+    // Check if test attempt already exists
+    const existingAttempt = await db.query(
+      `SELECT id FROM test_attempts WHERE application_id = $1 AND test_id = $2`,
+      [applicationId, req.params.id]
     );
+    
+    let attemptResult;
+    if (existingAttempt.rows.length > 0) {
+      // Update existing attempt
+      attemptResult = await db.query(
+        `UPDATE test_attempts SET
+          submitted_at = NOW(),
+          answers = $1,
+          score = $2,
+          max_score = $3,
+          percentage = $4,
+          passed = $5
+        WHERE application_id = $6 AND test_id = $7
+        RETURNING *`,
+        [JSON.stringify(answers), score, maxScore, percentage, passed, applicationId, req.params.id]
+      );
+      console.log('✅ Updated existing test attempt');
+    } else {
+      // Create new attempt
+      attemptResult = await db.query(
+        `INSERT INTO test_attempts (
+          application_id, test_id, started_at, submitted_at,
+          answers, score, max_score, percentage, passed, created_at
+        ) VALUES ($1, $2, NOW(), NOW(), $3, $4, $5, $6, $7, NOW())
+        RETURNING *`,
+        [applicationId, req.params.id, JSON.stringify(answers), score, maxScore, percentage, passed]
+      );
+      console.log('✅ Created new test attempt');
+    }
     
     // Update application status
     await db.query(
