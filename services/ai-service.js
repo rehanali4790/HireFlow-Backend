@@ -167,23 +167,34 @@ IMPORTANT NOTES:
 /**
  * Generate AI interview question
  */
-async function generateInterviewQuestion(jobDescription, jobRequirements, transcript, questionNumber) {
+async function generateInterviewQuestion(jobDescription, jobRequirements, transcript, questionNumber, maxQuestions = 8) {
   // Build conversation history for OpenAI
   const conversationHistory = transcript.map(entry => ({
     role: entry.role === 'ai' ? 'assistant' : 'user',
     content: entry.message
   }));
 
-  console.log(`📝 Building question ${questionNumber} with ${conversationHistory.length} messages in history`);
+  console.log(`📝 Building question ${questionNumber}/${maxQuestions} with ${conversationHistory.length} messages in history`);
 
-  // Check if interview should end
-  if (questionNumber >= 4) {
+  // Check if interview should end based on question count
+  if (questionNumber > maxQuestions) {
+    console.log(`🏁 Reached maximum questions (${maxQuestions}), ending interview`);
+    return {
+      should_end_interview: true,
+      end_reason: `Interview complete - all ${maxQuestions} questions have been asked`,
+      assessment: 'completed'
+    };
+  }
+
+  // Only check for early termination if we have more than 5 questions scheduled
+  // For short interviews (≤5 questions), always ask all questions
+  if (maxQuestions > 5 && questionNumber >= Math.min(6, maxQuestions - 1)) {
     const evaluationPrompt = `You are evaluating this interview. BE DECISIVE.
 
 Job Requirements: ${JSON.stringify(jobRequirements)}
 Job Description: ${jobDescription}
 
-Interview Transcript (${questionNumber} questions so far):
+Interview Transcript (${questionNumber} questions so far, max ${maxQuestions}):
 ${conversationHistory.map(m => `${m.role}: ${m.content}`).join('\n\n')}
 
 MAKE A DECISION NOW:
@@ -195,21 +206,14 @@ MAKE A DECISION NOW:
    - Doesn't match job requirements
    → END NOW with should_end: true
 
-2. If candidate seems QUALIFIED:
-   - Has relevant experience
-   - Can explain their work
-   - Matches most requirements
-   - After 5-6 questions → END with should_end: true
-   - After 4 questions if EXCELLENT → can END
+2. If candidate seems QUALIFIED or UNCERTAIN:
+   - Continue to ask remaining questions
+   - We're close to the end anyway (${maxQuestions - questionNumber} questions left)
+   → should_end: false
 
-3. If UNCERTAIN (only if truly unclear):
-   - Continue ONLY if you genuinely need more info
-   - Maximum 8 questions total
-   - Don't drag it out
+3. After ${maxQuestions} questions → MUST END regardless
 
-4. After 8 questions → MUST END regardless
-
-BE DECISIVE. Don't be polite and keep going. Real interviewers make decisions.
+BE DECISIVE. Only end early if candidate is CLEARLY not qualified.
 
 Respond ONLY with JSON:
 {
@@ -233,20 +237,27 @@ Respond ONLY with JSON:
       const jsonMatch = evalContent.match(/\{[\s\S]*\}/);
       const decision = JSON.parse(jsonMatch ? jsonMatch[0] : evalContent);
       
-      if (decision.should_end || questionNumber >= 10) {
+      // Only end early if explicitly decided AND candidate is clearly not qualified
+      if (decision.should_end && decision.assessment === 'not_qualified') {
+        console.log(`🏁 Ending interview early: ${decision.reason}`);
         return {
           should_end_interview: true,
           end_reason: decision.reason || 'Interview complete',
           assessment: decision.assessment
         };
+      } else {
+        console.log(`✅ Continuing interview: ${decision.reason || 'More questions needed'}`);
       }
     } catch (e) {
       console.error('Failed to parse decision:', e);
+      // On error, continue with interview
     }
   }
 
   // Generate next question with full context
   const systemPrompt = `You are a Senior Technical Interviewer conducting a professional technical interview. Act like a real person having a conversation, not a robot.
+
+This interview will have EXACTLY ${maxQuestions} questions total. You are currently on question ${questionNumber}.
 
 Your interviewing style:
 - Ask questions naturally, like a real interview conversation

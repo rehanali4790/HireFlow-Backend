@@ -480,6 +480,14 @@ router.post('/send-invitation', authMiddleware, async (req, res) => {
     
     // Send email with actual test details from database (set by HR)
     const emailService = require('../services/email-service');
+    
+    // Get employer industry for email template
+    const employerResult = await db.query(
+      'SELECT e.industry FROM employers e JOIN jobs j ON e.id = j.employer_id WHERE j.id = $1',
+      [application.job_id]
+    );
+    const industry = employerResult.rows[0]?.industry || 'other';
+    
     await emailService.sendTestInvitation(
       application.email,
       `${application.first_name} ${application.last_name}`,
@@ -493,7 +501,8 @@ router.post('/send-invitation', authMiddleware, async (req, res) => {
         testType: test.test_type === 'technical' ? 'Technical Assessment (MCQs)' : 
                   test.test_type === 'coding' ? 'Coding Challenge' :
                   test.test_type === 'behavioral' ? 'Behavioral Assessment' :
-                  'Multiple Choice Questions (MCQs)'
+                  'Multiple Choice Questions (MCQs)',
+        industry: industry
       }
     );
     
