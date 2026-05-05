@@ -267,11 +267,19 @@ router.post('/', async (req, res) => {
       });
       
       // Send confirmation email
+      // Get employer industry for email template
+      const employerResult = await db.query(
+        'SELECT industry FROM employers WHERE id = $1',
+        [job.employer_id]
+      );
+      const industry = employerResult.rows[0]?.industry || 'other';
+      
       emailService.sendApplicationConfirmation(
         email,
         `${firstName} ${lastName}`,
         job.title,
-        'HireFlow'
+        'HireFlow',
+        industry
       ).catch(err => {
         console.error('Email error:', err);
       });
@@ -398,13 +406,21 @@ router.post('/:id/approve', authMiddleware, async (req, res) => {
     );
     
     // Send email notification (async, don't wait)
+    // Get employer industry for email template
+    const employerResult = await db.query(
+      'SELECT e.industry FROM employers e JOIN jobs j ON e.id = j.employer_id WHERE j.id = $1',
+      [application.job_id]
+    );
+    const industry = employerResult.rows[0]?.industry || 'other';
+    
     if (approved) {
       emailService.sendShortlistEmail(
         application.candidate_email,
         candidateName,
         application.job_title,
         application.company_name || 'HireFlow',
-        nextSteps
+        nextSteps,
+        industry
       ).catch(err => {
         console.error('❌ Error sending shortlist email:', err);
       });
@@ -413,7 +429,8 @@ router.post('/:id/approve', authMiddleware, async (req, res) => {
         application.candidate_email,
         candidateName,
         application.job_title,
-        application.company_name || 'HireFlow'
+        application.company_name || 'HireFlow',
+        industry
       ).catch(err => {
         console.error('❌ Error sending rejection email:', err);
       });
@@ -423,6 +440,460 @@ router.post('/:id/approve', authMiddleware, async (req, res) => {
   } catch (error) {
     console.error('Approve application error:', error);
     res.status(500).json({ error: 'Failed to process approval' });
+  }
+});
+
+// Complete final interview (authenticated)
+router.post('/:id/final-interview-complete', authMiddleware, async (req, res) => {
+  const db = req.app.locals.db;
+  const { interviewerName, notes, rating, recommendation } = req.body;
+  
+  try {
+    // Check if application belongs to employer's job
+    const checkResult = await db.query(
+      `SELECT a.id FROM applications a
+       LEFT JOIN jobs j ON a.job_id = j.id
+       WHERE a.id = $1 AND j.employer_id = $2`,
+      [req.params.id, req.employerId]
+    );
+    
+    if (checkResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Application not found' });
+    }
+    
+    // Update application with final interview completion
+    await db.query(
+      `UPDATE applications
+       SET final_interview_completed_at = NOW(),
+           final_interview_notes = $1,
+           final_interview_rating = $2,
+           updated_at = NOW()
+       WHERE id = $3`,
+      [
+        `Interviewer: ${interviewerName}\n\nNotes: ${notes}\n\nRecommendation: ${recommendation}`,
+        rating,
+        req.params.id
+      ]
+    );
+    
+    console.log('✅ Final interview marked as completed');
+    
+    res.json({ success: true, message: 'Final interview completed' });
+  } catch (error) {
+    console.error('Complete final interview error:', error);
+    res.status(500).json({ error: 'Failed to complete final interview' });
+  }
+});
+
+// Mark as hired (authenticated)
+router.post('/:id/mark-hired', authMiddleware, async (req, res) => {
+  const db = req.app.locals.db;
+  const emailService = require('../services/email-service');
+  
+  try {
+    // Get application details
+    const appResult = await db.query(
+      `SELECT a.*, c.first_name, c.last_name, c.email, j.title as job_title, e.company_name
+       FROM applications a
+       LEFT JOIN candidates c ON a.candidate_id = c.id
+       LEFT JOIN jobs j ON a.job_id = j.id
+       LEFT JOIN employers e ON j.employer_id = e.id
+       WHERE a.id = $1 AND j.employer_id = $2`,
+      [req.params.id, req.employerId]
+    );
+    
+    if (appResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Application not found' });
+    }
+    
+    const application = appResult.rows[0];
+    const candidateName = `${application.first_name} ${application.last_name}`;
+    
+    // Update application to hired
+    await db.query(
+      `UPDATE applications
+       SET status = 'hired',
+           hired_at = NOW(),
+           updated_at = NOW()
+       WHERE id = $1`,
+      [req.params.id]
+    );
+    
+    console.log('✅ Candidate marked as hired');
+    
+    // Send welcome email
+    await emailService.sendEmail(
+      application.email,
+      `🎉 Welcome to ${application.company_name}!`,
+      `
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; background: #f9f9f9; padding: 20px;">
+          <div style="background: linear-gradient(135deg, #FBB03B, #F97316); padding: 30px; text-align: center; border-radius: 10px 10px 0 0;">
+            <h1 style="color: #0F0F0F; margin: 0; font-size: 32px;">🎉 Welcome Aboard!</h1>
+          </div>
+          
+          <div style="background: white; padding: 30px; border-radius: 0 0 10px 10px;">
+            <p style="font-size: 16px; color: #333;">Dear ${candidateName},</p>
+            
+            <p style="font-size: 15px; color: #555; line-height: 1.6;">
+              We are absolutely delighted to welcome you to the <strong>${application.company_name}</strong> team as our new <strong>${application.job_title}</strong>!
+            </p>
+            
+            <div style="background: #FFF8EC; border: 2px solid #FBB03B; border-radius: 12px; padding: 20px; margin: 25px 0; text-align: center;">
+              <h2 style="margin: 0; color: #C47F00; font-size: 24px;">🎊 You're Officially Hired!</h2>
+              <p style="margin: 10px 0 0; color: #666;">We can't wait to see the amazing contributions you'll make to our team.</p>
+            </div>
+            
+            <div style="background: #EFF6FF; border-left: 4px solid #2563EB; padding: 15px; margin: 20px 0;">
+              <h4 style="margin: 0 0 10px; color: #1E40AF;">📋 What's Next?</h4>
+              <ul style="margin: 0; padding-left: 20px; color: #666;">
+                <li style="margin: 5px 0;">Our HR team will contact you with onboarding details</li>
+                <li style="margin: 5px 0;">You'll receive information about your start date and first day</li>
+                <li style="margin: 5px 0;">We'll send you all necessary paperwork and documentation</li>
+                <li style="margin: 5px 0;">Get ready to meet your new team!</li>
+              </ul>
+            </div>
+            
+            <p style="font-size: 15px; color: #555; line-height: 1.6;">
+              If you have any questions before your start date, please don't hesitate to reach out to us.
+            </p>
+            
+            <p style="font-size: 15px; color: #333; margin-top: 30px;">
+              Welcome to the team!<br>
+              <strong>${application.company_name} Team</strong>
+            </p>
+          </div>
+          
+          <div style="text-align: center; padding: 20px; color: #999; font-size: 12px;">
+            <p>This is an automated message from HireFlow ATS</p>
+          </div>
+        </div>
+      `,
+      application.company_name
+    );
+    
+    console.log('✅ Welcome email sent');
+    
+    res.json({ success: true, message: 'Candidate marked as hired' });
+  } catch (error) {
+    console.error('Mark as hired error:', error);
+    res.status(500).json({ error: 'Failed to mark as hired' });
+  }
+});
+
+// Schedule final interview
+router.post('/:id/schedule-final-interview', authMiddleware, async (req, res) => {
+  const db = req.app.locals.db;
+  const { interviewDate, interviewTime, interviewType, location, interviewers, additionalNotes } = req.body;
+  
+  try {
+    // Get application details
+    const appResult = await db.query(
+      `SELECT a.*, c.first_name, c.last_name, c.email, j.title as job_title, e.company_name
+       FROM applications a
+       JOIN candidates c ON a.candidate_id = c.id
+       JOIN jobs j ON a.job_id = j.id
+       JOIN employers e ON j.employer_id = e.id
+       WHERE a.id = $1 AND j.employer_id = $2`,
+      [req.params.id, req.employerId]
+    );
+    
+    if (appResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Application not found' });
+    }
+    
+    const application = appResult.rows[0];
+    
+    // Update application status to final_interview
+    await db.query(
+      `UPDATE applications 
+       SET status = 'final_interview',
+           current_stage = 'final_interview',
+           final_interview_scheduled_at = NOW()
+       WHERE id = $1`,
+      [req.params.id]
+    );
+    
+    // Format date and time for email
+    const interviewDateTime = new Date(`${interviewDate}T${interviewTime}`);
+    const formattedDate = interviewDateTime.toLocaleDateString('en-US', { 
+      weekday: 'long', 
+      year: 'numeric', 
+      month: 'long', 
+      day: 'numeric' 
+    });
+    const formattedTime = interviewDateTime.toLocaleTimeString('en-US', { 
+      hour: '2-digit', 
+      minute: '2-digit',
+      hour12: true
+    });
+    
+    // Send email notification
+    const emailService = require('../services/email-service');
+    await emailService.sendEmail(
+      application.email,
+      `Final Interview Scheduled - ${application.job_title}`,
+      `
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+          <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 30px; text-align: center; border-radius: 10px 10px 0 0;">
+            <h1 style="color: white; margin: 0; font-size: 28px;">📅 Final Interview Scheduled!</h1>
+          </div>
+          
+          <div style="background: #f8f9fa; padding: 30px; border-radius: 0 0 10px 10px;">
+            <p style="font-size: 16px; color: #333; margin-bottom: 20px;">
+              Dear <strong>${application.first_name} ${application.last_name}</strong>,
+            </p>
+            
+            <p style="font-size: 15px; color: #555; line-height: 1.6;">
+              Congratulations! We're excited to invite you to the final interview for the 
+              <strong>${application.job_title}</strong> position at <strong>${application.company_name}</strong>.
+            </p>
+            
+            <div style="background: white; padding: 25px; border-radius: 10px; margin: 25px 0; border-left: 4px solid #667eea;">
+              <h2 style="color: #667eea; margin-top: 0; font-size: 20px;">Interview Details</h2>
+              
+              <div style="margin: 15px 0;">
+                <p style="margin: 8px 0; color: #333;">
+                  <strong>📅 Date:</strong> ${formattedDate}
+                </p>
+                <p style="margin: 8px 0; color: #333;">
+                  <strong>🕐 Time:</strong> ${formattedTime}
+                </p>
+                <p style="margin: 8px 0; color: #333;">
+                  <strong>${interviewType === 'video' ? '💻' : '📍'} Type:</strong> 
+                  ${interviewType === 'video' ? 'Video Call' : 'In-Person Interview'}
+                </p>
+                ${location ? `
+                  <p style="margin: 8px 0; color: #333;">
+                    <strong>${interviewType === 'video' ? '🔗 Platform' : '📍 Location'}:</strong> ${location}
+                  </p>
+                ` : ''}
+                <p style="margin: 8px 0; color: #333;">
+                  <strong>👥 Interview Panel:</strong> ${interviewers}
+                </p>
+              </div>
+            </div>
+            
+            ${additionalNotes ? `
+              <div style="background: #fff3cd; padding: 20px; border-radius: 10px; margin: 20px 0; border-left: 4px solid #ffc107;">
+                <h3 style="color: #856404; margin-top: 0; font-size: 16px;">📝 Additional Information</h3>
+                <p style="color: #856404; margin: 0; white-space: pre-line;">${additionalNotes}</p>
+              </div>
+            ` : ''}
+            
+            <div style="background: #d1ecf1; padding: 20px; border-radius: 10px; margin: 20px 0; border-left: 4px solid #17a2b8;">
+              <h3 style="color: #0c5460; margin-top: 0; font-size: 16px;">💡 Preparation Tips</h3>
+              <ul style="color: #0c5460; margin: 10px 0; padding-left: 20px;">
+                <li>Review the job description and requirements</li>
+                <li>Prepare questions about the role and company</li>
+                <li>Test your ${interviewType === 'video' ? 'internet connection and camera' : 'route to the office'}</li>
+                <li>Have your resume and portfolio ready to discuss</li>
+                <li>Arrive/Join ${interviewType === 'video' ? '5 minutes early' : '10 minutes early'}</li>
+              </ul>
+            </div>
+            
+            <p style="font-size: 15px; color: #555; line-height: 1.6; margin-top: 25px;">
+              If you need to reschedule or have any questions, please reply to this email or contact us as soon as possible.
+            </p>
+            
+            <p style="font-size: 15px; color: #333; margin-top: 30px;">
+              We look forward to meeting with you!<br>
+              <strong>${application.company_name} Hiring Team</strong>
+            </p>
+          </div>
+          
+          <div style="text-align: center; padding: 20px; color: #999; font-size: 12px;">
+            <p>This is an automated message from HireFlow ATS</p>
+          </div>
+        </div>
+      `,
+      application.company_name
+    );
+    
+    console.log('✅ Final interview scheduled and email sent');
+    
+    res.json({ 
+      success: true, 
+      message: 'Final interview scheduled successfully',
+      interviewDate: formattedDate,
+      interviewTime: formattedTime
+    });
+  } catch (error) {
+    console.error('Schedule final interview error:', error);
+    res.status(500).json({ error: 'Failed to schedule final interview' });
+  }
+});
+
+// Final Scoring Analysis (authenticated)
+router.post('/:id/final-scoring', authMiddleware, async (req, res) => {
+  const db = req.app.locals.db;
+  const { parameters } = req.body;
+  const aiService = require('../services/ai-service');
+
+  try {
+    // Get application details
+    const appResult = await db.query(
+      `SELECT 
+        a.id, a.status,
+        c.first_name, c.last_name, c.email,
+        j.title as job_title,
+        rs.overall_score as resume_score,
+        ta.percentage as test_percentage,
+        ta.passed as test_passed
+       FROM applications a
+       LEFT JOIN candidates c ON a.candidate_id = c.id
+       LEFT JOIN jobs j ON a.job_id = j.id
+       LEFT JOIN resume_scores rs ON a.id = rs.application_id
+       LEFT JOIN test_attempts ta ON a.id = ta.application_id
+       WHERE a.id = $1 AND j.employer_id = $2`,
+      [req.params.id, req.employerId]
+    );
+
+    if (appResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Application not found' });
+    }
+
+    const application = appResult.rows[0];
+
+    // Get AI interview data if available
+    const aiInterviewResult = await db.query(
+      `SELECT overall_score, communication_score, technical_score, behavioral_score
+       FROM ai_interviews
+       WHERE application_id = $1`,
+      [req.params.id]
+    );
+
+    const aiInterview = aiInterviewResult.rows[0] || null;
+
+    // Calculate overall score from parameters
+    const totalAchieved = parameters.reduce((sum, p) => sum + p.achievedScore, 0);
+    const totalMax = parameters.reduce((sum, p) => sum + p.maxScore, 0);
+    const finalScore = totalMax > 0 ? (totalAchieved / totalMax) * 100 : 0;
+
+    // Prepare data for AI analysis - ensure all scores are numbers
+    const resumeScore = Number(application.resume_score) || 0;
+    const testScore = Number(application.test_percentage) || 0;
+    const aiInterviewScore = Number(aiInterview?.overall_score) || 0;
+
+    const analysisData = {
+      candidateName: `${application.first_name} ${application.last_name}`,
+      jobTitle: application.job_title,
+      resumeScore: resumeScore,
+      testScore: testScore,
+      testPassed: application.test_passed || false,
+      aiInterviewScore: aiInterviewScore,
+      finalScoringParameters: parameters,
+      finalScore: finalScore,
+    };
+
+    // Generate AI decision
+    const prompt = `You are an expert HR analyst. Based on the following candidate evaluation data, provide a final hiring decision and recommendation.
+
+Candidate: ${analysisData.candidateName}
+Position: ${analysisData.jobTitle}
+
+Evaluation Scores:
+- Resume/CV Score: ${resumeScore.toFixed(1)}%
+- Technical Test Score: ${testScore.toFixed(1)}% (${analysisData.testPassed ? 'Passed' : 'Failed'})
+- AI Interview Score: ${aiInterviewScore.toFixed(1)}%
+
+Final Scoring Parameters:
+${parameters.map(p => `- ${p.name}: ${p.achievedScore}/${p.maxScore} (${((p.achievedScore/p.maxScore)*100).toFixed(1)}%)`).join('\n')}
+
+Overall Final Score: ${finalScore.toFixed(1)}%
+
+Provide a comprehensive final decision in 3-4 sentences that:
+1. Summarizes the candidate's overall performance across all evaluation stages
+2. Highlights key strengths and any concerns
+3. Makes a clear recommendation (Strongly Recommend Hire, Recommend Hire, Consider with Reservations, or Do Not Recommend)
+4. Provides brief reasoning for the recommendation
+
+Keep the response professional, concise, and actionable.`;
+
+    // Generate AI decision using OpenAI directly
+    const OpenAI = require('openai');
+    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+    
+    const aiResponse = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [
+        { role: 'system', content: 'You are an expert HR analyst providing hiring recommendations.' },
+        { role: 'user', content: prompt }
+      ],
+      temperature: 0.3,
+      max_tokens: 500,
+    });
+
+    const aiDecision = aiResponse.choices[0].message.content;
+
+    // Determine recommendation based on final score
+    let recommendation = 'do_not_hire';
+    if (finalScore >= 80) {
+      recommendation = 'hire';
+    } else if (finalScore >= 65) {
+      recommendation = 'consider';
+    }
+
+    // Store the final scoring in database
+    await db.query(
+      `INSERT INTO final_scoring (application_id, parameters, final_score, ai_decision, recommendation, created_at)
+       VALUES ($1, $2, $3, $4, $5, NOW())
+       ON CONFLICT (application_id) 
+       DO UPDATE SET parameters = $2, final_score = $3, ai_decision = $4, recommendation = $5, updated_at = NOW()`,
+      [req.params.id, JSON.stringify(parameters), finalScore, aiDecision, recommendation]
+    );
+
+    // Update application status to 'final_interview' after scoring
+    await db.query(
+      `UPDATE applications
+       SET status = 'final_interview',
+           updated_at = NOW()
+       WHERE id = $1`,
+      [req.params.id]
+    );
+
+    console.log('✅ Final scoring saved and status updated to final_interview');
+
+    res.json({
+      success: true,
+      finalScore: finalScore,
+      decision: aiDecision,
+      recommendation: recommendation,
+    });
+  } catch (error) {
+    console.error('Final scoring error:', error);
+    res.status(500).json({ error: 'Failed to process final scoring' });
+  }
+});
+
+// Get Final Scoring Data (authenticated)
+router.get('/:id/final-scoring', authMiddleware, async (req, res) => {
+  const db = req.app.locals.db;
+
+  try {
+    const result = await db.query(
+      `SELECT parameters, final_score, ai_decision, recommendation, created_at, updated_at
+       FROM final_scoring
+       WHERE application_id = $1`,
+      [req.params.id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.json({ exists: false });
+    }
+
+    const scoring = result.rows[0];
+    res.json({
+      exists: true,
+      parameters: scoring.parameters,
+      finalScore: Number(scoring.final_score),
+      decision: scoring.ai_decision,
+      recommendation: scoring.recommendation,
+      createdAt: scoring.created_at,
+      updatedAt: scoring.updated_at,
+    });
+  } catch (error) {
+    console.error('Get final scoring error:', error);
+    res.status(500).json({ error: 'Failed to retrieve final scoring' });
   }
 });
 

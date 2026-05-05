@@ -367,4 +367,76 @@ router.post('/:applicationId/final', authMiddleware, async (req, res) => {
   }
 });
 
+// Invite directly to interview (skip tests and AI interview) (authenticated)
+router.post('/:applicationId/invite-directly', authMiddleware, async (req, res) => {
+  const db = req.app.locals.db;
+  const emailService = require('../services/email-service');
+  
+  try {
+    // Verify application belongs to employer's job
+    const appResult = await db.query(
+      `SELECT a.*, c.first_name, c.last_name, c.email,
+              j.title as job_title, e.company_name
+       FROM applications a
+       LEFT JOIN candidates c ON a.candidate_id = c.id
+       LEFT JOIN jobs j ON a.job_id = j.id
+       LEFT JOIN employers e ON j.employer_id = e.id
+       WHERE a.id = $1 AND j.employer_id = $2`,
+      [req.params.applicationId, req.employerId]
+    );
+    
+    if (appResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Application not found' });
+    }
+    
+    const application = appResult.rows[0];
+    
+    // Update application status to final_interview
+    await db.query(
+      `UPDATE applications
+       SET status = 'final_interview',
+           updated_at = NOW()
+       WHERE id = $1`,
+      [req.params.applicationId]
+    );
+    
+    // Send email invitation
+    try {
+      await emailService.sendEmail(
+        application.email,
+        `🎯 Interview Invitation - ${application.job_title} at ${application.company_name}`,
+        `
+          <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+            <h2 style="color: #FBB03B;">Congratulations! You're Invited to Interview</h2>
+            <p>Dear ${application.first_name} ${application.last_name},</p>
+            <p>We're impressed with your application for the <strong>${application.job_title}</strong> position at <strong>${application.company_name}</strong>.</p>
+            <p>We would like to invite you to the next stage of our hiring process - a direct interview with our team.</p>
+            <p>Our team will reach out to you shortly to schedule a convenient time for the interview.</p>
+            <p>If you have any questions, please don't hesitate to contact us.</p>
+            <p>Best regards,<br>${application.company_name} Hiring Team</p>
+          </div>
+        `,
+        application.company_name
+      );
+    } catch (emailError) {
+      console.error('Failed to send interview invitation email:', emailError);
+      // Don't fail the request if email fails
+    }
+    
+    res.json({
+      success: true,
+      message: 'Interview invitation sent successfully',
+      application: {
+        id: application.id,
+        status: 'final_interview',
+        candidate_name: `${application.first_name} ${application.last_name}`,
+        email: application.email,
+      },
+    });
+  } catch (error) {
+    console.error('Invite directly error:', error);
+    res.status(500).json({ error: 'Failed to send interview invitation' });
+  }
+});
+
 module.exports = router;
