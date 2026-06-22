@@ -1,9 +1,10 @@
 const express = require('express');
 const router = express.Router();
 const authMiddleware = require('../middleware/auth');
+const { checkPermission, hasPermissionValue } = require('../middleware/permissions');
 
 // Get all roles for employer (authenticated)
-router.get('/', authMiddleware, async (req, res) => {
+router.get('/', authMiddleware, checkPermission('roles', 'read'), async (req, res) => {
   const db = req.app.locals.db;
 
   try {
@@ -26,7 +27,7 @@ router.get('/', authMiddleware, async (req, res) => {
 });
 
 // Get single role with permissions (authenticated)
-router.get('/:id', authMiddleware, async (req, res) => {
+router.get('/:id', authMiddleware, checkPermission('roles', 'read'), async (req, res) => {
   const db = req.app.locals.db;
 
   try {
@@ -65,24 +66,11 @@ router.get('/:id', authMiddleware, async (req, res) => {
 });
 
 // Create new role (authenticated, admin only)
-router.post('/', authMiddleware, async (req, res) => {
+router.post('/', authMiddleware, checkPermission('roles', 'write'), async (req, res) => {
   const db = req.app.locals.db;
   const { name, description, permissions } = req.body;
 
   try {
-    // Check if requester is admin
-    const requester = await db.query(
-      'SELECT is_admin FROM users WHERE id = $1 AND employer_id = $2',
-      [req.userId, req.employerId]
-    );
-
-    const isOwner = req.userId === req.employerId;
-    const isAdmin = requester.rows.length > 0 && requester.rows[0].is_admin;
-
-    if (!isOwner && !isAdmin) {
-      return res.status(403).json({ error: 'Only admins can create roles' });
-    }
-
     // Validate required fields
     if (!name) {
       return res.status(400).json({ error: 'Role name is required' });
@@ -134,18 +122,6 @@ router.post('/', authMiddleware, async (req, res) => {
 
     role.permissions = permissionsResult.rows;
 
-    // Log activity - only if userId exists in users table
-    try {
-      await db.query(
-        `INSERT INTO user_activity_log (user_id, employer_id, action, resource_type, resource_id, details)
-         VALUES ($1, $2, 'create_role', 'role', $3, $4)`,
-        [req.userId, req.employerId, role.id, JSON.stringify({ name })]
-      );
-    } catch (logError) {
-      // If logging fails (e.g., user_id not in users table), just log to console
-      console.log('Activity log skipped:', logError.message);
-    }
-
     res.status(201).json(role);
   } catch (error) {
     console.error('Create role error:', error);
@@ -154,24 +130,11 @@ router.post('/', authMiddleware, async (req, res) => {
 });
 
 // Update role (authenticated, admin only)
-router.put('/:id', authMiddleware, async (req, res) => {
+router.put('/:id', authMiddleware, checkPermission('roles', 'edit'), async (req, res) => {
   const db = req.app.locals.db;
   const { name, description, permissions } = req.body;
 
   try {
-    // Check if requester is admin
-    const requester = await db.query(
-      'SELECT is_admin FROM users WHERE id = $1 AND employer_id = $2',
-      [req.userId, req.employerId]
-    );
-
-    const isOwner = req.userId === req.employerId;
-    const isAdmin = requester.rows.length > 0 && requester.rows[0].is_admin;
-
-    if (!isOwner && !isAdmin) {
-      return res.status(403).json({ error: 'Only admins can update roles' });
-    }
-
     // Check if role exists
     const roleCheck = await db.query(
       'SELECT id, is_system_role FROM roles WHERE id = $1 AND employer_id = $2',
@@ -225,18 +188,6 @@ router.put('/:id', authMiddleware, async (req, res) => {
 
     role.permissions = permissionsResult.rows;
 
-    // Log activity - only if userId exists in users table
-    try {
-      await db.query(
-        `INSERT INTO user_activity_log (user_id, employer_id, action, resource_type, resource_id, details)
-         VALUES ($1, $2, 'update_role', 'role', $3, $4)`,
-        [req.userId, req.employerId, role.id, JSON.stringify({ name })]
-      );
-    } catch (logError) {
-      // If logging fails (e.g., user_id not in users table), just log to console
-      console.log('Activity log skipped:', logError.message);
-    }
-
     res.json(role);
   } catch (error) {
     console.error('Update role error:', error);
@@ -245,23 +196,10 @@ router.put('/:id', authMiddleware, async (req, res) => {
 });
 
 // Delete role (authenticated, admin only)
-router.delete('/:id', authMiddleware, async (req, res) => {
+router.delete('/:id', authMiddleware, checkPermission('roles', 'delete'), async (req, res) => {
   const db = req.app.locals.db;
 
   try {
-    // Check if requester is admin
-    const requester = await db.query(
-      'SELECT is_admin FROM users WHERE id = $1 AND employer_id = $2',
-      [req.userId, req.employerId]
-    );
-
-    const isOwner = req.userId === req.employerId;
-    const isAdmin = requester.rows.length > 0 && requester.rows[0].is_admin;
-
-    if (!isOwner && !isAdmin) {
-      return res.status(403).json({ error: 'Only admins can delete roles' });
-    }
-
     // Check if role exists
     const roleCheck = await db.query(
       'SELECT id, is_system_role, name FROM roles WHERE id = $1 AND employer_id = $2',
@@ -291,18 +229,6 @@ router.delete('/:id', authMiddleware, async (req, res) => {
       [req.params.id, req.employerId]
     );
 
-    // Log activity - only if userId exists in users table
-    try {
-      await db.query(
-        `INSERT INTO user_activity_log (user_id, employer_id, action, resource_type, resource_id, details)
-         VALUES ($1, $2, 'delete_role', 'role', $3, $4)`,
-        [req.userId, req.employerId, req.params.id, JSON.stringify({ name: roleCheck.rows[0].name })]
-      );
-    } catch (logError) {
-      // If logging fails (e.g., user_id not in users table), just log to console
-      console.log('Activity log skipped:', logError.message);
-    }
-
     res.json({ success: true, message: 'Role deleted successfully' });
   } catch (error) {
     console.error('Delete role error:', error);
@@ -311,24 +237,11 @@ router.delete('/:id', authMiddleware, async (req, res) => {
 });
 
 // Update role permissions (authenticated, admin only)
-router.put('/:id/permissions', authMiddleware, async (req, res) => {
+router.put('/:id/permissions', authMiddleware, checkPermission('roles', 'edit'), async (req, res) => {
   const db = req.app.locals.db;
   const { permissions } = req.body;
 
   try {
-    // Check if requester is admin
-    const requester = await db.query(
-      'SELECT is_admin FROM users WHERE id = $1 AND employer_id = $2',
-      [req.userId, req.employerId]
-    );
-
-    const isOwner = req.userId === req.employerId;
-    const isAdmin = requester.rows.length > 0 && requester.rows[0].is_admin;
-
-    if (!isOwner && !isAdmin) {
-      return res.status(403).json({ error: 'Only admins can update permissions' });
-    }
-
     // Check if role exists
     const roleCheck = await db.query(
       'SELECT id, is_system_role FROM roles WHERE id = $1 AND employer_id = $2',
@@ -368,18 +281,6 @@ router.put('/:id/permissions', authMiddleware, async (req, res) => {
       [req.params.id]
     );
 
-    // Log activity - only if userId exists in users table
-    try {
-      await db.query(
-        `INSERT INTO user_activity_log (user_id, employer_id, action, resource_type, resource_id)
-         VALUES ($1, $2, 'update_permissions', 'role', $3)`,
-        [req.userId, req.employerId, req.params.id]
-      );
-    } catch (logError) {
-      // If logging fails (e.g., user_id not in users table), just log to console
-      console.log('Activity log skipped:', logError.message);
-    }
-
     res.json(result.rows);
   } catch (error) {
     console.error('Update permissions error:', error);
@@ -389,18 +290,28 @@ router.put('/:id/permissions', authMiddleware, async (req, res) => {
 
 // Get available resources
 router.get('/resources/list', authMiddleware, async (req, res) => {
-  const resources = [
-    { id: 'jobs', name: 'Jobs', description: 'Manage job postings' },
-    { id: 'applications', name: 'Applications', description: 'Review and manage applications' },
-    { id: 'candidates', name: 'Candidates', description: 'View and manage candidate profiles' },
-    { id: 'tests', name: 'Tests', description: 'Create and manage assessment tests' },
-    { id: 'interviews', name: 'Interviews', description: 'Schedule and conduct interviews' },
-    { id: 'analytics', name: 'Analytics', description: 'View reports and analytics' },
-    { id: 'settings', name: 'Settings', description: 'Manage company settings' },
-    { id: 'users', name: 'Users', description: 'Manage team members and permissions' }
-  ];
+  const db = req.app.locals.db;
 
-  res.json(resources);
+  try {
+    const canReadRoles = await hasPermissionValue(req, 'roles', 'read');
+    const canEditRoles = await hasPermissionValue(req, 'roles', 'edit');
+
+    if (!canReadRoles && !canEditRoles) {
+      return res.status(403).json({ error: 'You do not have permission to view permission resources' });
+    }
+
+    const result = await db.query(
+      `SELECT id, name, description, category, sort_order
+       FROM permission_resources
+       WHERE is_active = true
+       ORDER BY category, sort_order, name`
+    );
+
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Get permission resources error:', error);
+    res.status(500).json({ error: 'Failed to fetch permission resources' });
+  }
 });
 
 module.exports = router;

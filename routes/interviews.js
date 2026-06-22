@@ -1,10 +1,11 @@
 const express = require('express');
 const { v4: uuidv4 } = require('uuid');
 const authMiddleware = require('../middleware/auth');
+const { checkPermission } = require('../middleware/permissions');
 const router = express.Router();
 
 // Get all interviews for employer (authenticated)
-router.get('/', authMiddleware, async (req, res) => {
+router.get('/', authMiddleware, checkPermission('interviews', 'read'), async (req, res) => {
   const db = req.app.locals.db;
   
   try {
@@ -57,7 +58,7 @@ router.get('/token/:token', async (req, res) => {
 });
 
 // Create AI interview (authenticated)
-router.post('/', authMiddleware, async (req, res) => {
+router.post('/', authMiddleware, checkPermission('interviews', 'write'), async (req, res) => {
   const db = req.app.locals.db;
   const { applicationId } = req.body;
   
@@ -324,7 +325,7 @@ router.post('/token/:token/complete', async (req, res) => {
 });
 
 // Schedule final interview (authenticated)
-router.post('/:applicationId/final', authMiddleware, async (req, res) => {
+router.post('/:applicationId/final', authMiddleware, checkPermission('interviews', 'write'), async (req, res) => {
   const db = req.app.locals.db;
   const { scheduledAt, interviewerName } = req.body;
   
@@ -368,7 +369,7 @@ router.post('/:applicationId/final', authMiddleware, async (req, res) => {
 });
 
 // Invite directly to interview (skip tests and AI interview) (authenticated)
-router.post('/:applicationId/invite-directly', authMiddleware, async (req, res) => {
+router.post('/:applicationId/invite-directly', authMiddleware, checkPermission('interviews', 'write'), async (req, res) => {
   const db = req.app.locals.db;
   const emailService = require('../services/email-service');
   

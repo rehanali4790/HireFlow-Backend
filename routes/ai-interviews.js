@@ -1,7 +1,45 @@
 const express = require('express');
 const authMiddleware = require('../middleware/auth');
+const { checkPermission } = require('../middleware/permissions');
+const { getActor, logActivity } = require('../middleware/audit-log');
 const router = express.Router();
 const { v4: uuidv4 } = require('uuid');
+
+async function applyApplicationUpdater(db, req, applicationId) {
+  const actor = await getActor(db, req.userId, req.employerId);
+  await db.query(
+    `UPDATE applications
+     SET updated_by_name = $1,
+         updated_by_email = $2,
+         updated_at = NOW()
+     WHERE id = $3`,
+    [actor.actorName, actor.actorEmail, applicationId]
+  );
+}
+
+async function logCandidateNotification(req, event) {
+  await logActivity(req, {
+    employerId: event.employerId,
+    actorName: event.candidateName,
+    actorEmail: event.candidateEmail,
+    action: event.action,
+    resourceType: 'candidate_notifications',
+    resourceId: event.applicationId,
+    statusCode: 200,
+    details: {
+      event_type: event.eventType,
+      title: event.title,
+      message: event.message,
+      severity: event.severity,
+      candidate_name: event.candidateName,
+      candidate_email: event.candidateEmail,
+      job_title: event.jobTitle,
+      overall_score: event.overallScore,
+      recommendation: event.recommendation,
+      reason: event.reason,
+    },
+  });
+}
 
 // Get AI interview by token (public - for candidate)
 router.get('/token/:token', async (req, res) => {
@@ -11,6 +49,7 @@ router.get('/token/:token', async (req, res) => {
     const result = await db.query(
       `SELECT ai.*, 
               a.id as application_id,
+              a.status as application_status,
               c.first_name, c.last_name, c.email, c.resume_url, c.skills, c.experience_years, c.resume_parsed_data,
               j.title as job_title, j.description as job_description, j.requirements as job_requirements, j.skills_required
        FROM ai_interviews ai
@@ -33,7 +72,7 @@ router.get('/token/:token', async (req, res) => {
 });
 
 // Get AI interview by application ID (authenticated - for HR)
-router.get('/application/:applicationId', authMiddleware, async (req, res) => {
+router.get('/application/:applicationId', authMiddleware, checkPermission('ai_interviews', 'read'), async (req, res) => {
   const db = req.app.locals.db;
   
   try {
@@ -82,6 +121,73 @@ router.post('/token/:token/start', async (req, res) => {
   } catch (error) {
     console.error('Start AI interview error:', error);
     res.status(500).json({ error: 'Failed to start interview' });
+  }
+});
+
+// Cancel AI interview after proctoring violation (public - candidate tab switch/blur)
+router.post('/token/:token/cancel', async (req, res) => {
+  const db = req.app.locals.db;
+  const { reason } = req.body;
+
+  try {
+    const result = await db.query(
+      `SELECT ai.*, a.id as application_id,
+              c.first_name, c.last_name, c.email,
+              j.title as job_title, j.employer_id
+       FROM ai_interviews ai
+       LEFT JOIN applications a ON ai.application_id = a.id
+       LEFT JOIN candidates c ON a.candidate_id = c.id
+       LEFT JOIN jobs j ON a.job_id = j.id
+       WHERE ai.interview_token = $1`,
+      [req.params.token]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Interview not found' });
+    }
+
+    const interview = result.rows[0];
+
+    await db.query(
+      `UPDATE ai_interviews
+       SET updated_at = NOW()
+       WHERE interview_token = $1`,
+      [req.params.token]
+    );
+
+    await db.query(
+      `UPDATE applications
+       SET status = 'ai_interview_cancelled',
+           rejection_reason = $1,
+           updated_at = NOW()
+       WHERE id = $2`,
+      [reason || 'AI interview cancelled due to tab switch / focus loss. HR approval required for retake.', interview.application_id]
+    );
+
+    const candidateName = `${interview.first_name || ''} ${interview.last_name || ''}`.trim() || interview.email || 'Candidate';
+    const violationReason = reason || 'Tab switch / focus loss detected during AI interview.';
+    await logCandidateNotification(req, {
+      employerId: interview.employer_id,
+      applicationId: interview.application_id,
+      candidateName,
+      candidateEmail: interview.email,
+      jobTitle: interview.job_title,
+      action: 'violation',
+      eventType: 'ai_interview_proctoring_violation',
+      severity: 'warning',
+      title: 'AI Interview Proctoring Violation',
+      message: `${candidateName} triggered an AI interview proctoring violation: ${violationReason}`,
+      reason: violationReason,
+    });
+
+    res.json({
+      success: true,
+      cancelled: true,
+      message: 'AI interview cancelled due to proctoring violation. Please contact HR for retake approval.'
+    });
+  } catch (error) {
+    console.error('Cancel AI interview error:', error);
+    res.status(500).json({ error: 'Failed to cancel AI interview' });
   }
 });
 
@@ -305,10 +411,12 @@ router.post('/token/:token/complete', async (req, res) => {
     const interviewResult = await db.query(
       `SELECT ai.*, 
               a.id as application_id,
+              c.first_name, c.last_name, c.email,
               j.title as job_title, j.description as job_description, 
-              j.requirements as job_requirements
+              j.requirements as job_requirements, j.employer_id
        FROM ai_interviews ai
        LEFT JOIN applications a ON ai.application_id = a.id
+       LEFT JOIN candidates c ON a.candidate_id = c.id
        LEFT JOIN jobs j ON a.job_id = j.id
        WHERE ai.interview_token = $1`,
       [req.params.token]
@@ -383,6 +491,22 @@ router.post('/token/:token/complete', async (req, res) => {
        WHERE id = $1`,
       [interview.application_id]
     );
+
+    const candidateName = `${interview.first_name || ''} ${interview.last_name || ''}`.trim() || interview.email || 'Candidate';
+    await logCandidateNotification(req, {
+      employerId: interview.employer_id,
+      applicationId: interview.application_id,
+      candidateName,
+      candidateEmail: interview.email,
+      jobTitle: interview.job_title,
+      action: 'completed',
+      eventType: 'ai_interview_completed',
+      severity: 'success',
+      title: 'AI Interview Completed',
+      message: `${candidateName} completed the AI interview for ${interview.job_title || 'the job'}.`,
+      overallScore: evaluation.overall_score,
+      recommendation: evaluation.recommendation,
+    });
     
     console.log('✅ Interview completed successfully');
     
@@ -397,7 +521,7 @@ router.post('/token/:token/complete', async (req, res) => {
 });
 
 // Send AI interview invitation (authenticated - HR)
-router.post('/send-invitation', authMiddleware, async (req, res) => {
+router.post('/send-invitation', authMiddleware, checkPermission('ai_interviews', 'write'), async (req, res) => {
   const db = req.app.locals.db;
   const { applicationId, validFrom, validUntil, questionCount } = req.body;
   const emailService = require('../services/email-service');
@@ -441,6 +565,25 @@ router.post('/send-invitation', authMiddleware, async (req, res) => {
     if (existingInterview.rows.length > 0) {
       interviewToken = existingInterview.rows[0].interview_token;
       console.log('♻️  Reusing existing interview token:', interviewToken);
+
+      await db.query(
+        `UPDATE ai_interviews 
+         SET started_at = NULL,
+             completed_at = NULL,
+             questions_asked = $1,
+             candidate_responses = $2,
+             technical_score = NULL,
+             communication_score = NULL,
+             problem_solving_score = NULL,
+             overall_score = NULL,
+             ai_summary = NULL,
+             recommendation = NULL,
+             video_url = NULL,
+             updated_at = NOW()
+         WHERE interview_token = $3`,
+        [JSON.stringify([]), JSON.stringify([]), interviewToken]
+      );
+      console.log('✅ Existing AI interview attempt reset for retake');
       
       // Update validity dates if provided
       if (validFrom && validUntil) {
@@ -572,6 +715,7 @@ router.post('/send-invitation', authMiddleware, async (req, res) => {
        WHERE id = $1`,
       [applicationId]
     );
+    await applyApplicationUpdater(db, req, applicationId);
     console.log('✅ Application status updated to "ai_interview"');
     
     res.json({
@@ -586,7 +730,7 @@ router.post('/send-invitation', authMiddleware, async (req, res) => {
 });
 
 // Get all AI interviews for employer (authenticated)
-router.get('/', authMiddleware, async (req, res) => {
+router.get('/', authMiddleware, checkPermission('ai_interviews', 'read'), async (req, res) => {
   const db = req.app.locals.db;
   
   try {
@@ -634,7 +778,7 @@ router.get('/', authMiddleware, async (req, res) => {
 });
 
 // Approve AI interview (authenticated - HR)
-router.post('/:applicationId/approve', authMiddleware, async (req, res) => {
+router.post('/:applicationId/approve', authMiddleware, checkPermission('ai_interviews', 'edit'), async (req, res) => {
   const db = req.app.locals.db;
   const { applicationId } = req.params;
   const { approved, notes } = req.body;
@@ -671,6 +815,7 @@ router.post('/:applicationId/approve', authMiddleware, async (req, res) => {
          WHERE id = $1`,
         [applicationId]
       );
+      await applyApplicationUpdater(db, req, applicationId);
       
       console.log('✅ AI interview approved, status updated to final_interview');
       
@@ -732,6 +877,7 @@ router.post('/:applicationId/approve', authMiddleware, async (req, res) => {
          WHERE id = $2`,
         [notes || 'Did not meet AI interview requirements', applicationId]
       );
+      await applyApplicationUpdater(db, req, applicationId);
       
       console.log('❌ AI interview rejected');
       

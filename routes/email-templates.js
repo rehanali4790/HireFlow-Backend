@@ -1,9 +1,10 @@
 const express = require('express');
 const authMiddleware = require('../middleware/auth');
+const { checkPermission } = require('../middleware/permissions');
 const router = express.Router();
 
 // Get all email templates for employer (authenticated)
-router.get('/', authMiddleware, async (req, res) => {
+router.get('/', authMiddleware, checkPermission('email_templates', 'read'), async (req, res) => {
   const db = req.app.locals.db;
   
   try {
@@ -22,7 +23,7 @@ router.get('/', authMiddleware, async (req, res) => {
 });
 
 // Get single email template
-router.get('/:id', authMiddleware, async (req, res) => {
+router.get('/:id', authMiddleware, checkPermission('email_templates', 'read'), async (req, res) => {
   const db = req.app.locals.db;
   
   try {
@@ -43,7 +44,7 @@ router.get('/:id', authMiddleware, async (req, res) => {
 });
 
 // Create email template (authenticated)
-router.post('/', authMiddleware, async (req, res) => {
+router.post('/', authMiddleware, checkPermission('email_templates', 'write'), async (req, res) => {
   const db = req.app.locals.db;
   const { name, subject, body, templateType } = req.body;
   
@@ -64,7 +65,7 @@ router.post('/', authMiddleware, async (req, res) => {
 });
 
 // Update email template (authenticated)
-router.put('/:id', authMiddleware, async (req, res) => {
+router.put('/:id', authMiddleware, checkPermission('email_templates', 'edit'), async (req, res) => {
   const db = req.app.locals.db;
   const { name, subject, body, templateType } = req.body;
   
@@ -89,7 +90,7 @@ router.put('/:id', authMiddleware, async (req, res) => {
 });
 
 // Delete email template (authenticated)
-router.delete('/:id', authMiddleware, async (req, res) => {
+router.delete('/:id', authMiddleware, checkPermission('email_templates', 'delete'), async (req, res) => {
   const db = req.app.locals.db;
   
   try {

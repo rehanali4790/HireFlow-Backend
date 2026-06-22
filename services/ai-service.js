@@ -382,8 +382,54 @@ Respond ONLY with valid JSON in this exact format:
   }
 }
 
+async function generateJobContent(prompt) {
+  const response = await openai.chat.completions.create({
+    model: 'gpt-4o-mini',
+    messages: [
+      {
+        role: 'system',
+        content: `You are an expert HR job description writer. Generate concise, professional job posting content.
+Return ONLY valid JSON with these exact keys:
+{
+  "title": string,
+  "description": string,
+  "requirements": string,
+  "responsibilities": string,
+  "skills_required": string[]
+}
+Rules:
+- Only generate the five requested fields.
+- Do not include salary, location, work type, remote policy, education, status, or positions.
+- Keep requirements and responsibilities as newline bullet lists using "- ".
+- skills_required must be 5-10 concise skill names.`
+      },
+      {
+        role: 'user',
+        content: `Create job posting fields from this HR prompt:\n\n${prompt}`
+      }
+    ],
+    temperature: 0.35,
+    max_tokens: 900,
+    response_format: { type: 'json_object' }
+  });
+
+  const content = response.choices[0].message.content;
+  const parsed = JSON.parse(content);
+
+  return {
+    title: String(parsed.title || '').trim(),
+    description: String(parsed.description || '').trim(),
+    requirements: String(parsed.requirements || '').trim(),
+    responsibilities: String(parsed.responsibilities || '').trim(),
+    skills_required: Array.isArray(parsed.skills_required)
+      ? parsed.skills_required.map((skill) => String(skill).trim()).filter(Boolean)
+      : [],
+  };
+}
+
 module.exports = {
   analyzeResume,
   generateInterviewQuestion,
   evaluateInterview,
+  generateJobContent,
 };

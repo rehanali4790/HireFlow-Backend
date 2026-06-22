@@ -1,9 +1,10 @@
 const express = require('express');
 const authMiddleware = require('../middleware/auth');
+const { checkPermission } = require('../middleware/permissions');
 const router = express.Router();
 
 // Get dashboard analytics (authenticated)
-router.get('/dashboard', authMiddleware, async (req, res) => {
+router.get('/dashboard', authMiddleware, checkPermission('analytics', 'read'), async (req, res) => {
   const db = req.app.locals.db;
   
   try {
@@ -121,7 +122,7 @@ router.get('/dashboard', authMiddleware, async (req, res) => {
 });
 
 // Get job-specific analytics (authenticated)
-router.get('/jobs/:jobId', authMiddleware, async (req, res) => {
+router.get('/jobs/:jobId', authMiddleware, checkPermission('analytics', 'read'), async (req, res) => {
   const db = req.app.locals.db;
   
   try {

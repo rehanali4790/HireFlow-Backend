@@ -1,5 +1,8 @@
 const express = require('express');
 const authMiddleware = require('../middleware/auth');
+const { checkPermission } = require('../middleware/permissions');
+const { getActor } = require('../middleware/audit-log');
+const { generateJobContent } = require('../services/ai-service');
 const router = express.Router();
 
 // Get all jobs (public - only active, authenticated - all own jobs)
@@ -64,8 +67,25 @@ router.get('/:id', async (req, res) => {
   }
 });
 
+// Generate job content with AI (authenticated)
+router.post('/generate-content', authMiddleware, checkPermission('jobs', 'write'), async (req, res) => {
+  const { prompt } = req.body;
+
+  if (!prompt || !String(prompt).trim()) {
+    return res.status(400).json({ error: 'Prompt is required' });
+  }
+
+  try {
+    const content = await generateJobContent(String(prompt).trim());
+    res.json(content);
+  } catch (error) {
+    console.error('Generate job content error:', error);
+    res.status(500).json({ error: 'Failed to generate job content' });
+  }
+});
+
 // Create job (authenticated)
-router.post('/', authMiddleware, async (req, res) => {
+router.post('/', authMiddleware, checkPermission('jobs', 'write'), async (req, res) => {
   const db = req.app.locals.db;
   const {
     title,
@@ -87,14 +107,15 @@ router.post('/', authMiddleware, async (req, res) => {
   } = req.body;
   
   try {
+    const actor = await getActor(db, req.userId, req.employerId);
     const result = await db.query(
       `INSERT INTO jobs (
         employer_id, title, description, requirements, responsibilities,
         skills_required, location, work_type, remote_policy,
         salary_min, salary_max, salary_currency, experience_level,
         education_required, status, application_deadline, positions_available,
-        created_at, updated_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, NOW(), NOW())
+        updated_by_name, updated_by_email, created_at, updated_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, NOW(), NOW())
       RETURNING *`,
       [
         req.employerId,
@@ -114,6 +135,8 @@ router.post('/', authMiddleware, async (req, res) => {
         status || 'draft',
         application_deadline,
         positions_available || 1,
+        actor.actorName,
+        actor.actorEmail,
       ]
     );
     
@@ -125,10 +148,11 @@ router.post('/', authMiddleware, async (req, res) => {
 });
 
 // Update job (authenticated)
-router.put('/:id', authMiddleware, async (req, res) => {
+router.put('/:id', authMiddleware, checkPermission('jobs', 'edit'), async (req, res) => {
   const db = req.app.locals.db;
   
   try {
+    const actor = await getActor(db, req.userId, req.employerId);
     // Check if job belongs to employer
     const checkResult = await db.query(
       'SELECT id FROM jobs WHERE id = $1 AND employer_id = $2',
@@ -158,8 +182,10 @@ router.put('/:id', authMiddleware, async (req, res) => {
     
     values.push(req.params.id);
     
+    values.push(actor.actorName, actor.actorEmail);
+
     const result = await db.query(
-      `UPDATE jobs SET ${updates.join(', ')}, updated_at = NOW()
+      `UPDATE jobs SET ${updates.join(', ')}, updated_by_name = $${paramCount + 1}, updated_by_email = $${paramCount + 2}, updated_at = NOW()
        WHERE id = $${paramCount}
        RETURNING *`,
       values
@@ -173,7 +199,7 @@ router.put('/:id', authMiddleware, async (req, res) => {
 });
 
 // Delete job (authenticated)
-router.delete('/:id', authMiddleware, async (req, res) => {
+router.delete('/:id', authMiddleware, checkPermission('jobs', 'delete'), async (req, res) => {
   const db = req.app.locals.db;
   
   try {
@@ -194,7 +220,7 @@ router.delete('/:id', authMiddleware, async (req, res) => {
 });
 
 // Get applications for a job (authenticated)
-router.get('/:id/applications', authMiddleware, async (req, res) => {
+router.get('/:id/applications', authMiddleware, checkPermission('applications', 'read'), async (req, res) => {
   const db = req.app.locals.db;
   
   try {

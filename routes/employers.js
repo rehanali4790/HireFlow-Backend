@@ -1,10 +1,11 @@
 const express = require('express');
 const router = express.Router();
 const authMiddleware = require('../middleware/auth');
+const { checkPermission } = require('../middleware/permissions');
 
 // Get employer profile (authenticated)
 // Works for both employers (owners) and team members
-router.get('/:userId', authMiddleware, async (req, res) => {
+router.get('/:userId', authMiddleware, checkPermission('settings', 'read'), async (req, res) => {
   const db = req.app.locals.db;
 
   try {
@@ -29,7 +30,7 @@ router.get('/:userId', authMiddleware, async (req, res) => {
 });
 
 // Update employer profile (authenticated, owner/admin only)
-router.put('/:userId', authMiddleware, async (req, res) => {
+router.put('/:userId', authMiddleware, checkPermission('settings', 'edit'), async (req, res) => {
   const db = req.app.locals.db;
   const {
     company_name,

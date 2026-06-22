@@ -4,6 +4,7 @@ const path = require('path');
 const fs = require('fs');
 const { v4: uuidv4 } = require('uuid');
 const authMiddleware = require('../middleware/auth');
+const { checkPermission } = require('../middleware/permissions');
 const pdf = require('pdf-parse');
 const router = express.Router();
 
@@ -31,7 +32,7 @@ const upload = multer({
 });
 
 // Analyze single resume with AI (authenticated)
-router.post('/analyze-resume', authMiddleware, upload.single('resume'), async (req, res) => {
+router.post('/analyze-resume', authMiddleware, checkPermission('bulk_upload', 'write'), upload.single('resume'), async (req, res) => {
   const db = req.app.locals.db;
   const { jobId } = req.body;
   
@@ -154,7 +155,7 @@ If any field is not found, use reasonable defaults:
 });
 
 // Submit application from bulk upload (authenticated)
-router.post('/submit-application', authMiddleware, upload.single('resume'), async (req, res) => {
+router.post('/submit-application', authMiddleware, checkPermission('bulk_upload', 'write'), upload.single('resume'), async (req, res) => {
   const db = req.app.locals.db;
   const { jobId, firstName, lastName, email, phone, skills, experienceYears } = req.body;
   
@@ -230,7 +231,7 @@ router.post('/submit-application', authMiddleware, upload.single('resume'), asyn
 });
 
 // Create bulk upload session (authenticated)
-router.post('/session', authMiddleware, async (req, res) => {
+router.post('/session', authMiddleware, checkPermission('bulk_upload', 'write'), async (req, res) => {
   const db = req.app.locals.db;
   const { jobId, totalCandidates } = req.body;
   
@@ -261,7 +262,7 @@ router.post('/session', authMiddleware, async (req, res) => {
 });
 
 // Upload candidates in bulk (authenticated)
-router.post('/candidates', authMiddleware, upload.single('file'), async (req, res) => {
+router.post('/candidates', authMiddleware, checkPermission('bulk_upload', 'write'), upload.single('file'), async (req, res) => {
   const db = req.app.locals.db;
   const { sessionId, candidates } = req.body;
   
@@ -362,7 +363,7 @@ router.post('/candidates', authMiddleware, upload.single('file'), async (req, re
 });
 
 // Get bulk upload session status (authenticated)
-router.get('/session/:id', authMiddleware, async (req, res) => {
+router.get('/session/:id', authMiddleware, checkPermission('bulk_upload', 'read'), async (req, res) => {
   const db = req.app.locals.db;
   
   try {
@@ -384,7 +385,7 @@ router.get('/session/:id', authMiddleware, async (req, res) => {
 });
 
 // Get all bulk upload sessions for employer (authenticated)
-router.get('/sessions', authMiddleware, async (req, res) => {
+router.get('/sessions', authMiddleware, checkPermission('bulk_upload', 'read'), async (req, res) => {
   const db = req.app.locals.db;
   
   try {

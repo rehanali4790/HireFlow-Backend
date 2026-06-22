@@ -1,9 +1,24 @@
 const express = require('express');
 const authMiddleware = require('../middleware/auth');
+const { checkPermission } = require('../middleware/permissions');
+const { getActor } = require('../middleware/audit-log');
 const router = express.Router();
 
+async function applyApplicationUpdater(db, req, applicationId) {
+  const actor = await getActor(db, req.userId, req.employerId);
+  await db.query(
+    `UPDATE applications
+     SET updated_by_name = $1,
+         updated_by_email = $2,
+         updated_at = NOW()
+     WHERE id = $3`,
+    [actor.actorName, actor.actorEmail, applicationId]
+  );
+  return actor;
+}
+
 // Get all applications (authenticated - employer's jobs only)
-router.get('/', authMiddleware, async (req, res) => {
+router.get('/', authMiddleware, checkPermission('applications', 'read'), async (req, res) => {
   const db = req.app.locals.db;
   
   try {
@@ -32,7 +47,7 @@ router.get('/', authMiddleware, async (req, res) => {
 });
 
 // Get single application
-router.get('/:id', authMiddleware, async (req, res) => {
+router.get('/:id', authMiddleware, checkPermission('applications', 'read'), async (req, res) => {
   const db = req.app.locals.db;
   
   try {
@@ -302,7 +317,7 @@ router.post('/', async (req, res) => {
 });
 
 // Update application status (authenticated)
-router.patch('/:id/status', authMiddleware, async (req, res) => {
+router.patch('/:id/status', authMiddleware, checkPermission('applications', 'edit'), async (req, res) => {
   const db = req.app.locals.db;
   const { status, notes } = req.body;
   
@@ -327,6 +342,10 @@ router.patch('/:id/status', authMiddleware, async (req, res) => {
        RETURNING *`,
       [status, notes, req.params.id]
     );
+    const actor = await applyApplicationUpdater(db, req, req.params.id);
+    result.rows[0].updated_by_name = actor.actorName;
+    result.rows[0].updated_by_email = actor.actorEmail;
+    result.rows[0].updated_at = new Date().toISOString();
     
     res.json(result.rows[0]);
   } catch (error) {
@@ -335,8 +354,57 @@ router.patch('/:id/status', authMiddleware, async (req, res) => {
   }
 });
 
+// Update per-candidate pipeline skip settings (authenticated)
+router.patch('/:id/pipeline-skips', authMiddleware, checkPermission('applications', 'edit'), async (req, res) => {
+  const db = req.app.locals.db;
+  const {
+    skip_test = false,
+    skip_ai_interview = false,
+    skip_final_interview = false,
+  } = req.body;
+
+  try {
+    // Check if application belongs to employer's job
+    const checkResult = await db.query(
+      `SELECT a.id FROM applications a
+       LEFT JOIN jobs j ON a.job_id = j.id
+       WHERE a.id = $1 AND j.employer_id = $2`,
+      [req.params.id, req.employerId]
+    );
+
+    if (checkResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Application not found' });
+    }
+
+    const result = await db.query(
+      `UPDATE applications
+       SET skip_test = $1,
+           skip_ai_interview = $2,
+           skip_final_interview = $3,
+           updated_at = NOW()
+       WHERE id = $4
+       RETURNING *`,
+      [
+        Boolean(skip_test),
+        Boolean(skip_ai_interview),
+        Boolean(skip_final_interview),
+        req.params.id,
+      ]
+    );
+    const actor = await applyApplicationUpdater(db, req, req.params.id);
+    result.rows[0].updated_by_name = actor.actorName;
+    result.rows[0].updated_by_email = actor.actorEmail;
+    result.rows[0].updated_at = new Date().toISOString();
+
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error('Update pipeline skips error:', error);
+    res.status(500).json({ error: 'Failed to update pipeline skips' });
+  }
+});
+
 // Approve/reject at approval gate (authenticated)
-router.post('/:id/approve', authMiddleware, async (req, res) => {
+router.post('/:id/approve', authMiddleware, checkPermission('applications', 'edit'), async (req, res) => {
   const db = req.app.locals.db;
   const { gateName, approved, notes } = req.body;
   const emailService = require('../services/email-service');
@@ -394,6 +462,10 @@ router.post('/:id/approve', authMiddleware, async (req, res) => {
     updateQuery += ` WHERE id = $2 RETURNING *`;
     
     const result = await db.query(updateQuery, [newStatus, req.params.id]);
+    const actor = await applyApplicationUpdater(db, req, req.params.id);
+    result.rows[0].updated_by_name = actor.actorName;
+    result.rows[0].updated_by_email = actor.actorEmail;
+    result.rows[0].updated_at = new Date().toISOString();
     
     // Log approval gate decision
     await db.query(
@@ -444,7 +516,7 @@ router.post('/:id/approve', authMiddleware, async (req, res) => {
 });
 
 // Complete final interview (authenticated)
-router.post('/:id/final-interview-complete', authMiddleware, async (req, res) => {
+router.post('/:id/final-interview-complete', authMiddleware, checkPermission('applications', 'edit'), async (req, res) => {
   const db = req.app.locals.db;
   const { interviewerName, notes, rating, recommendation } = req.body;
   
@@ -475,6 +547,7 @@ router.post('/:id/final-interview-complete', authMiddleware, async (req, res) =>
         req.params.id
       ]
     );
+    await applyApplicationUpdater(db, req, req.params.id);
     
     console.log('✅ Final interview marked as completed');
     
@@ -486,7 +559,7 @@ router.post('/:id/final-interview-complete', authMiddleware, async (req, res) =>
 });
 
 // Mark as hired (authenticated)
-router.post('/:id/mark-hired', authMiddleware, async (req, res) => {
+router.post('/:id/mark-hired', authMiddleware, checkPermission('applications', 'edit'), async (req, res) => {
   const db = req.app.locals.db;
   const emailService = require('../services/email-service');
   
@@ -518,6 +591,7 @@ router.post('/:id/mark-hired', authMiddleware, async (req, res) => {
        WHERE id = $1`,
       [req.params.id]
     );
+    await applyApplicationUpdater(db, req, req.params.id);
     
     console.log('✅ Candidate marked as hired');
     
@@ -581,7 +655,7 @@ router.post('/:id/mark-hired', authMiddleware, async (req, res) => {
 });
 
 // Schedule final interview
-router.post('/:id/schedule-final-interview', authMiddleware, async (req, res) => {
+router.post('/:id/schedule-final-interview', authMiddleware, checkPermission('applications', 'write'), async (req, res) => {
   const db = req.app.locals.db;
   const { interviewDate, interviewTime, interviewType, location, interviewers, additionalNotes } = req.body;
   
@@ -608,10 +682,12 @@ router.post('/:id/schedule-final-interview', authMiddleware, async (req, res) =>
       `UPDATE applications 
        SET status = 'final_interview',
            current_stage = 'final_interview',
-           final_interview_scheduled_at = NOW()
+           final_interview_scheduled_at = NOW(),
+           updated_at = NOW()
        WHERE id = $1`,
       [req.params.id]
     );
+    await applyApplicationUpdater(db, req, req.params.id);
     
     // Format date and time for email
     const interviewDateTime = new Date(`${interviewDate}T${interviewTime}`);
@@ -724,7 +800,7 @@ router.post('/:id/schedule-final-interview', authMiddleware, async (req, res) =>
 });
 
 // Final Scoring Analysis (authenticated)
-router.post('/:id/final-scoring', authMiddleware, async (req, res) => {
+router.post('/:id/final-scoring', authMiddleware, checkPermission('applications', 'edit'), async (req, res) => {
   const db = req.app.locals.db;
   const { parameters } = req.body;
   const aiService = require('../services/ai-service');
@@ -833,13 +909,25 @@ Keep the response professional, concise, and actionable.`;
       recommendation = 'consider';
     }
 
+    const actor = await getActor(db, req.userId, req.employerId);
+
     // Store the final scoring in database
     await db.query(
-      `INSERT INTO final_scoring (application_id, parameters, final_score, ai_decision, recommendation, created_at)
-       VALUES ($1, $2, $3, $4, $5, NOW())
+      `INSERT INTO final_scoring (
+         application_id, parameters, final_score, ai_decision, recommendation,
+         updated_by_name, updated_by_email, created_at, updated_at
+       )
+       VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
        ON CONFLICT (application_id) 
-       DO UPDATE SET parameters = $2, final_score = $3, ai_decision = $4, recommendation = $5, updated_at = NOW()`,
-      [req.params.id, JSON.stringify(parameters), finalScore, aiDecision, recommendation]
+       DO UPDATE SET
+         parameters = $2,
+         final_score = $3,
+         ai_decision = $4,
+         recommendation = $5,
+         updated_by_name = $6,
+         updated_by_email = $7,
+         updated_at = NOW()`,
+      [req.params.id, JSON.stringify(parameters), finalScore, aiDecision, recommendation, actor.actorName, actor.actorEmail]
     );
 
     // Update application status to 'final_interview' after scoring
@@ -850,6 +938,7 @@ Keep the response professional, concise, and actionable.`;
        WHERE id = $1`,
       [req.params.id]
     );
+    await applyApplicationUpdater(db, req, req.params.id);
 
     console.log('✅ Final scoring saved and status updated to final_interview');
 
@@ -858,6 +947,9 @@ Keep the response professional, concise, and actionable.`;
       finalScore: finalScore,
       decision: aiDecision,
       recommendation: recommendation,
+      updatedByName: actor.actorName,
+      updatedByEmail: actor.actorEmail,
+      updatedAt: new Date().toISOString(),
     });
   } catch (error) {
     console.error('Final scoring error:', error);
@@ -866,12 +958,13 @@ Keep the response professional, concise, and actionable.`;
 });
 
 // Get Final Scoring Data (authenticated)
-router.get('/:id/final-scoring', authMiddleware, async (req, res) => {
+router.get('/:id/final-scoring', authMiddleware, checkPermission('applications', 'read'), async (req, res) => {
   const db = req.app.locals.db;
 
   try {
     const result = await db.query(
-      `SELECT parameters, final_score, ai_decision, recommendation, created_at, updated_at
+      `SELECT parameters, final_score, ai_decision, recommendation,
+              updated_by_name, updated_by_email, created_at, updated_at
        FROM final_scoring
        WHERE application_id = $1`,
       [req.params.id]
@@ -888,6 +981,8 @@ router.get('/:id/final-scoring', authMiddleware, async (req, res) => {
       finalScore: Number(scoring.final_score),
       decision: scoring.ai_decision,
       recommendation: scoring.recommendation,
+      updatedByName: scoring.updated_by_name,
+      updatedByEmail: scoring.updated_by_email,
       createdAt: scoring.created_at,
       updatedAt: scoring.updated_at,
     });

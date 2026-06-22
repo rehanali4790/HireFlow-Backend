@@ -1,9 +1,10 @@
 const express = require('express');
 const authMiddleware = require('../middleware/auth');
+const { checkPermission } = require('../middleware/permissions');
 const router = express.Router();
 
 // Extend offer to candidate (authenticated)
-router.post('/', authMiddleware, async (req, res) => {
+router.post('/', authMiddleware, checkPermission('offers', 'write'), async (req, res) => {
   const db = req.app.locals.db;
   const emailService = require('../services/email-service');
   
@@ -185,7 +186,7 @@ router.post('/', authMiddleware, async (req, res) => {
 });
 
 // Get offer by application ID (authenticated)
-router.get('/application/:applicationId', authMiddleware, async (req, res) => {
+router.get('/application/:applicationId', authMiddleware, checkPermission('offers', 'read'), async (req, res) => {
   const db = req.app.locals.db;
   
   try {
@@ -211,7 +212,7 @@ router.get('/application/:applicationId', authMiddleware, async (req, res) => {
 });
 
 // Update offer status (authenticated)
-router.patch('/:offerId/status', authMiddleware, async (req, res) => {
+router.patch('/:offerId/status', authMiddleware, checkPermission('offers', 'edit'), async (req, res) => {
   const db = req.app.locals.db;
   const { status } = req.body; // accepted, rejected, withdrawn
   

@@ -1,9 +1,10 @@
 const express = require('express');
 const authMiddleware = require('../middleware/auth');
+const { checkPermission } = require('../middleware/permissions');
 const router = express.Router();
 
 // Get all candidates (authenticated - only those who applied to employer's jobs)
-router.get('/', authMiddleware, async (req, res) => {
+router.get('/', authMiddleware, checkPermission('candidates', 'read'), async (req, res) => {
   const db = req.app.locals.db;
   
   try {
@@ -28,7 +29,7 @@ router.get('/', authMiddleware, async (req, res) => {
 });
 
 // Get single candidate (authenticated)
-router.get('/:id', authMiddleware, async (req, res) => {
+router.get('/:id', authMiddleware, checkPermission('candidates', 'read'), async (req, res) => {
   const db = req.app.locals.db;
   
   try {

@@ -1,9 +1,49 @@
 const express = require('express');
 const authMiddleware = require('../middleware/auth');
+const { checkPermission } = require('../middleware/permissions');
+const { getActor, logActivity } = require('../middleware/audit-log');
 const router = express.Router();
 
+async function applyApplicationUpdater(db, req, applicationId) {
+  const actor = await getActor(db, req.userId, req.employerId);
+  await db.query(
+    `UPDATE applications
+     SET updated_by_name = $1,
+         updated_by_email = $2,
+         updated_at = NOW()
+     WHERE id = $3`,
+    [actor.actorName, actor.actorEmail, applicationId]
+  );
+}
+
+async function logCandidateNotification(req, event) {
+  await logActivity(req, {
+    employerId: event.employerId,
+    actorName: event.candidateName,
+    actorEmail: event.candidateEmail,
+    action: event.action,
+    resourceType: 'candidate_notifications',
+    resourceId: event.applicationId,
+    statusCode: 200,
+    details: {
+      event_type: event.eventType,
+      title: event.title,
+      message: event.message,
+      severity: event.severity,
+      candidate_name: event.candidateName,
+      candidate_email: event.candidateEmail,
+      job_title: event.jobTitle,
+      test_title: event.testTitle,
+      score: event.score,
+      percentage: event.percentage,
+      passed: event.passed,
+      reason: event.reason,
+    },
+  });
+}
+
 // Get all tests for employer (authenticated)
-router.get('/', authMiddleware, async (req, res) => {
+router.get('/', authMiddleware, checkPermission('tests', 'read'), async (req, res) => {
   const db = req.app.locals.db;
   
   try {
@@ -63,7 +103,7 @@ router.get('/:id', async (req, res) => {
 });
 
 // Create test (authenticated)
-router.post('/', authMiddleware, async (req, res) => {
+router.post('/', authMiddleware, checkPermission('tests', 'write'), async (req, res) => {
   const db = req.app.locals.db;
   const {
     jobId,
@@ -76,6 +116,7 @@ router.post('/', authMiddleware, async (req, res) => {
   } = req.body;
   
   try {
+    const actor = await getActor(db, req.userId, req.employerId);
     // Verify job belongs to employer
     const jobCheck = await db.query(
       'SELECT id FROM jobs WHERE id = $1 AND employer_id = $2',
@@ -100,8 +141,8 @@ router.post('/', authMiddleware, async (req, res) => {
       `INSERT INTO tests (
         job_id, employer_id, title, description, test_type,
         duration_minutes, passing_score, questions, answer_key,
-        status, ai_evaluation_enabled, is_ai_generated, created_at, updated_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW(), NOW())
+        status, ai_evaluation_enabled, is_ai_generated, updated_by_name, updated_by_email, created_at, updated_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW(), NOW())
       RETURNING *`,
       [
         jobId, 
@@ -115,7 +156,9 @@ router.post('/', authMiddleware, async (req, res) => {
         JSON.stringify(answerKey),
         'active',
         false,
-        false
+        false,
+        actor.actorName,
+        actor.actorEmail
       ]
     );
     
@@ -252,6 +295,38 @@ router.post('/:id/submit', async (req, res) => {
        WHERE id = $1`,
       [applicationId]
     );
+
+    const notificationResult = await db.query(
+      `SELECT a.id as application_id, c.first_name, c.last_name, c.email,
+              j.title as job_title, j.employer_id, t.title as test_title
+       FROM applications a
+       LEFT JOIN candidates c ON a.candidate_id = c.id
+       LEFT JOIN jobs j ON a.job_id = j.id
+       LEFT JOIN tests t ON t.id = $2
+       WHERE a.id = $1`,
+      [applicationId, req.params.id]
+    );
+
+    if (notificationResult.rows.length > 0) {
+      const row = notificationResult.rows[0];
+      const candidateName = `${row.first_name || ''} ${row.last_name || ''}`.trim() || row.email || 'Candidate';
+      await logCandidateNotification(req, {
+        employerId: row.employer_id,
+        applicationId,
+        candidateName,
+        candidateEmail: row.email,
+        jobTitle: row.job_title,
+        testTitle: row.test_title || test.title,
+        action: 'completed',
+        eventType: 'test_completed',
+        severity: 'success',
+        title: 'Test Completed',
+        message: `${candidateName} completed ${row.test_title || test.title || 'the test'} for ${row.job_title || 'the job'}.`,
+        score,
+        percentage,
+        passed,
+      });
+    }
     
     res.json({
       success: true,
@@ -267,8 +342,93 @@ router.post('/:id/submit', async (req, res) => {
   }
 });
 
+// Cancel test attempt after proctoring violation (public - candidate tab switch/blur)
+router.post('/:id/cancel', async (req, res) => {
+  const db = req.app.locals.db;
+  const { applicationId, reason } = req.body;
+
+  try {
+    if (!applicationId) {
+      return res.status(400).json({ error: 'Application ID is required' });
+    }
+
+    const existingAttempt = await db.query(
+      `SELECT id FROM test_attempts WHERE application_id = $1 AND test_id = $2`,
+      [applicationId, req.params.id]
+    );
+
+    if (existingAttempt.rows.length > 0) {
+      await db.query(
+        `UPDATE test_attempts
+         SET is_expired = true,
+             extension_reason = $1,
+             updated_at = NOW()
+         WHERE id = $2`,
+        [reason || 'Cancelled due to tab switch / focus loss', existingAttempt.rows[0].id]
+      );
+    } else {
+      await db.query(
+        `INSERT INTO test_attempts (
+          application_id, test_id, started_at, link_sent_at, link_expires_at,
+          is_expired, extension_reason, created_at
+        ) VALUES ($1, $2, NOW(), NOW(), NOW(), true, $3, NOW())`,
+        [applicationId, req.params.id, reason || 'Cancelled due to tab switch / focus loss']
+      );
+    }
+
+    await db.query(
+      `UPDATE applications
+       SET status = 'testing',
+           rejection_reason = $1,
+           updated_at = NOW()
+       WHERE id = $2`,
+      [reason || 'Test cancelled due to tab switch / focus loss. HR approval required for retake.', applicationId]
+    );
+
+    const notificationResult = await db.query(
+      `SELECT a.id as application_id, c.first_name, c.last_name, c.email,
+              j.title as job_title, j.employer_id, t.title as test_title
+       FROM applications a
+       LEFT JOIN candidates c ON a.candidate_id = c.id
+       LEFT JOIN jobs j ON a.job_id = j.id
+       LEFT JOIN tests t ON t.id = $2
+       WHERE a.id = $1`,
+      [applicationId, req.params.id]
+    );
+
+    if (notificationResult.rows.length > 0) {
+      const row = notificationResult.rows[0];
+      const candidateName = `${row.first_name || ''} ${row.last_name || ''}`.trim() || row.email || 'Candidate';
+      const violationReason = reason || 'Tab switch / focus loss detected during test.';
+      await logCandidateNotification(req, {
+        employerId: row.employer_id,
+        applicationId,
+        candidateName,
+        candidateEmail: row.email,
+        jobTitle: row.job_title,
+        testTitle: row.test_title,
+        action: 'violation',
+        eventType: 'test_proctoring_violation',
+        severity: 'warning',
+        title: 'Test Proctoring Violation',
+        message: `${candidateName} triggered a test proctoring violation: ${violationReason}`,
+        reason: violationReason,
+      });
+    }
+
+    res.json({
+      success: true,
+      cancelled: true,
+      message: 'Test cancelled due to proctoring violation. Please contact HR for retake approval.'
+    });
+  } catch (error) {
+    console.error('Cancel test attempt error:', error);
+    res.status(500).json({ error: 'Failed to cancel test attempt' });
+  }
+});
+
 // Get test attempts for a test (authenticated)
-router.get('/:id/attempts', authMiddleware, async (req, res) => {
+router.get('/:id/attempts', authMiddleware, checkPermission('tests', 'read'), async (req, res) => {
   const db = req.app.locals.db;
   
   try {
@@ -291,7 +451,7 @@ router.get('/:id/attempts', authMiddleware, async (req, res) => {
 });
 
 // Update test (authenticated)
-router.put('/:id', authMiddleware, async (req, res) => {
+router.put('/:id', authMiddleware, checkPermission('tests', 'edit'), async (req, res) => {
   const db = req.app.locals.db;
   const {
     jobId,
@@ -304,6 +464,7 @@ router.put('/:id', authMiddleware, async (req, res) => {
   } = req.body;
   
   try {
+    const actor = await getActor(db, req.userId, req.employerId);
     // Verify test belongs to employer
     const testCheck = await db.query(
       'SELECT id FROM tests WHERE id = $1 AND employer_id = $2',
@@ -347,8 +508,10 @@ router.put('/:id', authMiddleware, async (req, res) => {
         passing_score = COALESCE($6, passing_score),
         questions = COALESCE($7, questions),
         answer_key = COALESCE($8, answer_key),
+        updated_by_name = $9,
+        updated_by_email = $10,
         updated_at = NOW()
-      WHERE id = $9 AND employer_id = $10
+      WHERE id = $11 AND employer_id = $12
       RETURNING *`,
       [
         jobId,
@@ -359,6 +522,8 @@ router.put('/:id', authMiddleware, async (req, res) => {
         passingScore,
         questions ? JSON.stringify(questions) : null,
         answerKey ? JSON.stringify(answerKey) : null,
+        actor.actorName,
+        actor.actorEmail,
         req.params.id,
         req.employerId
       ]
@@ -372,7 +537,7 @@ router.put('/:id', authMiddleware, async (req, res) => {
 });
 
 // Delete test (authenticated)
-router.delete('/:id', authMiddleware, async (req, res) => {
+router.delete('/:id', authMiddleware, checkPermission('tests', 'delete'), async (req, res) => {
   const db = req.app.locals.db;
   
   try {
@@ -393,7 +558,7 @@ router.delete('/:id', authMiddleware, async (req, res) => {
 });
 
 // Send test invitation to candidate (authenticated)
-router.post('/send-invitation', authMiddleware, async (req, res) => {
+router.post('/send-invitation', authMiddleware, checkPermission('tests', 'write'), async (req, res) => {
   const db = req.app.locals.db;
   const { applicationId } = req.body;
   
@@ -440,6 +605,21 @@ router.post('/send-invitation', authMiddleware, async (req, res) => {
     if (existingAttempt.rows.length > 0) {
       testAttempt = existingAttempt.rows[0];
       
+      if (!testAttempt.submitted_at) {
+        const resetResult = await db.query(
+          `UPDATE test_attempts
+           SET link_sent_at = NOW(),
+               link_expires_at = NOW() + INTERVAL '24 hours',
+               is_expired = false,
+               extension_reason = NULL,
+               updated_at = NOW()
+           WHERE id = $1
+           RETURNING *`,
+          [testAttempt.id]
+        );
+        testAttempt = resetResult.rows[0];
+      }
+
       // Check if link has expired
       const now = new Date();
       const expiresAt = new Date(testAttempt.link_expires_at);
@@ -513,6 +693,7 @@ router.post('/send-invitation', authMiddleware, async (req, res) => {
        WHERE id = $1`,
       [applicationId]
     );
+    await applyApplicationUpdater(db, req, applicationId);
     
     res.json({
       success: true,
@@ -560,6 +741,15 @@ router.get('/check-expiration/:testId', async (req, res) => {
         message: 'Test already submitted'
       });
     }
+
+    if (attempt.is_expired) {
+      return res.status(403).json({
+        expired: true,
+        cancelled: true,
+        message: attempt.extension_reason || 'This test was cancelled due to a proctoring violation. Please contact HR for retake approval.',
+        expiresAt: attempt.link_expires_at
+      });
+    }
     
     // Check expiration
     const now = new Date();
@@ -596,7 +786,7 @@ router.get('/check-expiration/:testId', async (req, res) => {
 });
 
 // Extend test link expiration (authenticated - HR only)
-router.post('/extend-link/:applicationId', authMiddleware, async (req, res) => {
+router.post('/extend-link/:applicationId', authMiddleware, checkPermission('tests', 'edit'), async (req, res) => {
   const db = req.app.locals.db;
   const { applicationId } = req.params;
   const { reason, extensionHours } = req.body;

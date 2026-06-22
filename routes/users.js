@@ -2,14 +2,16 @@ const express = require('express');
 const router = express.Router();
 const bcrypt = require('bcryptjs');
 const authMiddleware = require('../middleware/auth');
+const { checkPermission } = require('../middleware/permissions');
 
 // Get all users for employer (authenticated)
-router.get('/', authMiddleware, async (req, res) => {
+router.get('/', authMiddleware, checkPermission('users', 'read'), async (req, res) => {
   const db = req.app.locals.db;
 
   try {
     const result = await db.query(
       `SELECT u.id, u.email, u.first_name, u.last_name, u.phone, u.avatar_url,
+              u.department, u.designation,
               u.is_active, u.is_admin, u.last_login, u.created_at, u.updated_at,
               u.role_id, r.name as role_name, r.description as role_description
        FROM users u
@@ -27,12 +29,13 @@ router.get('/', authMiddleware, async (req, res) => {
 });
 
 // Get single user (authenticated)
-router.get('/:id', authMiddleware, async (req, res) => {
+router.get('/:id', authMiddleware, checkPermission('users', 'read'), async (req, res) => {
   const db = req.app.locals.db;
 
   try {
     const result = await db.query(
       `SELECT u.id, u.email, u.first_name, u.last_name, u.phone, u.avatar_url,
+              u.department, u.designation,
               u.is_active, u.is_admin, u.last_login, u.created_at, u.updated_at,
               u.role_id, r.name as role_name, r.description as role_description
        FROM users u
@@ -53,7 +56,7 @@ router.get('/:id', authMiddleware, async (req, res) => {
 });
 
 // Create new user (authenticated, admin only)
-router.post('/', authMiddleware, async (req, res) => {
+router.post('/', authMiddleware, checkPermission('users', 'write'), async (req, res) => {
   const db = req.app.locals.db;
   const {
     email,
@@ -61,24 +64,14 @@ router.post('/', authMiddleware, async (req, res) => {
     last_name,
     password,
     phone,
+    department,
+    designation,
     role_id,
     is_admin
   } = req.body;
 
   try {
-    // Check if requester is admin
-    const requester = await db.query(
-      'SELECT is_admin FROM users WHERE id = $1 AND employer_id = $2',
-      [req.userId, req.employerId]
-    );
-
-    // If not a user, check if it's the employer (owner)
-    const isOwner = req.userId === req.employerId;
-    const isAdmin = requester.rows.length > 0 && requester.rows[0].is_admin;
-
-    if (!isOwner && !isAdmin) {
-      return res.status(403).json({ error: 'Only admins can create users' });
-    }
+    const normalizedRoleId = role_id || null;
 
     // Validate required fields
     if (!email || !first_name || !last_name || !password) {
@@ -96,10 +89,10 @@ router.post('/', authMiddleware, async (req, res) => {
     }
 
     // Verify role belongs to this employer
-    if (role_id) {
+    if (normalizedRoleId) {
       const roleCheck = await db.query(
         'SELECT id FROM roles WHERE id = $1 AND employer_id = $2',
-        [role_id, req.employerId]
+        [normalizedRoleId, req.employerId]
       );
 
       if (roleCheck.rows.length === 0) {
@@ -114,22 +107,11 @@ router.post('/', authMiddleware, async (req, res) => {
     const result = await db.query(
       `INSERT INTO users (
         employer_id, email, first_name, last_name, password_hash,
-        phone, role_id, is_admin, is_active, created_at, updated_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true, NOW(), NOW())
-      RETURNING id, email, first_name, last_name, phone, role_id, is_admin, is_active, created_at`,
-      [req.employerId, email, first_name, last_name, password_hash, phone, role_id, is_admin || false]
+        phone, department, designation, role_id, is_admin, is_active, created_at, updated_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, true, NOW(), NOW())
+      RETURNING id, email, first_name, last_name, phone, department, designation, role_id, is_admin, is_active, created_at`,
+      [req.employerId, email, first_name, last_name, password_hash, phone, department || null, designation || null, normalizedRoleId, is_admin || false]
     );
-
-    // Log activity - only if userId exists in users table
-    try {
-      await db.query(
-        `INSERT INTO user_activity_log (user_id, employer_id, action, resource_type, resource_id, details)
-         VALUES ($1, $2, 'create_user', 'user', $3, $4)`,
-        [req.userId, req.employerId, result.rows[0].id, JSON.stringify({ email, role_id })]
-      );
-    } catch (logError) {
-      console.log('Activity log skipped:', logError.message);
-    }
 
     res.status(201).json(result.rows[0]);
   } catch (error) {
@@ -139,31 +121,22 @@ router.post('/', authMiddleware, async (req, res) => {
 });
 
 // Update user (authenticated, admin only)
-router.put('/:id', authMiddleware, async (req, res) => {
+router.put('/:id', authMiddleware, checkPermission('users', 'edit'), async (req, res) => {
   const db = req.app.locals.db;
   const {
     email,
     first_name,
     last_name,
     phone,
+    department,
+    designation,
     role_id,
     is_admin,
     is_active
   } = req.body;
 
   try {
-    // Check if requester is admin
-    const requester = await db.query(
-      'SELECT is_admin FROM users WHERE id = $1 AND employer_id = $2',
-      [req.userId, req.employerId]
-    );
-
-    const isOwner = req.userId === req.employerId;
-    const isAdminUser = requester.rows.length > 0 && requester.rows[0].is_admin;
-
-    if (!isOwner && !isAdminUser) {
-      return res.status(403).json({ error: 'Only admins can update users' });
-    }
+    const normalizedRoleId = role_id || null;
 
     // Verify user belongs to this employer
     const userCheck = await db.query(
@@ -176,10 +149,10 @@ router.put('/:id', authMiddleware, async (req, res) => {
     }
 
     // Verify role belongs to this employer if provided
-    if (role_id) {
+    if (normalizedRoleId) {
       const roleCheck = await db.query(
         'SELECT id FROM roles WHERE id = $1 AND employer_id = $2',
-        [role_id, req.employerId]
+        [normalizedRoleId, req.employerId]
       );
 
       if (roleCheck.rows.length === 0) {
@@ -206,25 +179,16 @@ router.put('/:id', authMiddleware, async (req, res) => {
            first_name = COALESCE($2, first_name),
            last_name = COALESCE($3, last_name),
            phone = COALESCE($4, phone),
-           role_id = COALESCE($5, role_id),
-           is_admin = COALESCE($6, is_admin),
-           is_active = COALESCE($7, is_active),
+           department = $5,
+           designation = $6,
+           role_id = $7,
+           is_admin = COALESCE($8, is_admin),
+           is_active = COALESCE($9, is_active),
            updated_at = NOW()
-       WHERE id = $8 AND employer_id = $9
-       RETURNING id, email, first_name, last_name, phone, role_id, is_admin, is_active, updated_at`,
-      [email, first_name, last_name, phone, role_id, is_admin, is_active, req.params.id, req.employerId]
+       WHERE id = $10 AND employer_id = $11
+       RETURNING id, email, first_name, last_name, phone, department, designation, role_id, is_admin, is_active, updated_at`,
+      [email, first_name, last_name, phone, department || null, designation || null, normalizedRoleId, is_admin, is_active, req.params.id, req.employerId]
     );
-
-    // Log activity - only if userId exists in users table
-    try {
-      await db.query(
-        `INSERT INTO user_activity_log (user_id, employer_id, action, resource_type, resource_id, details)
-         VALUES ($1, $2, 'update_user', 'user', $3, $4)`,
-        [req.userId, req.employerId, req.params.id, JSON.stringify({ role_id, is_admin, is_active })]
-      );
-    } catch (logError) {
-      console.log('Activity log skipped:', logError.message);
-    }
 
     res.json(result.rows[0]);
   } catch (error) {
@@ -234,23 +198,10 @@ router.put('/:id', authMiddleware, async (req, res) => {
 });
 
 // Delete user (authenticated, admin only)
-router.delete('/:id', authMiddleware, async (req, res) => {
+router.delete('/:id', authMiddleware, checkPermission('users', 'delete'), async (req, res) => {
   const db = req.app.locals.db;
 
   try {
-    // Check if requester is admin
-    const requester = await db.query(
-      'SELECT is_admin FROM users WHERE id = $1 AND employer_id = $2',
-      [req.userId, req.employerId]
-    );
-
-    const isOwner = req.userId === req.employerId;
-    const isAdmin = requester.rows.length > 0 && requester.rows[0].is_admin;
-
-    if (!isOwner && !isAdmin) {
-      return res.status(403).json({ error: 'Only admins can delete users' });
-    }
-
     // Prevent deleting yourself
     if (req.params.id === req.userId) {
       return res.status(400).json({ error: 'Cannot delete your own account' });
@@ -266,17 +217,6 @@ router.delete('/:id', authMiddleware, async (req, res) => {
       return res.status(404).json({ error: 'User not found' });
     }
 
-    // Log activity - only if userId exists in users table
-    try {
-      await db.query(
-        `INSERT INTO user_activity_log (user_id, employer_id, action, resource_type, resource_id, details)
-         VALUES ($1, $2, 'delete_user', 'user', $3, $4)`,
-        [req.userId, req.employerId, req.params.id, JSON.stringify({ email: result.rows[0].email })]
-      );
-    } catch (logError) {
-      console.log('Activity log skipped:', logError.message);
-    }
-
     res.json({ success: true, message: 'User deleted successfully' });
   } catch (error) {
     console.error('Delete user error:', error);
@@ -285,24 +225,11 @@ router.delete('/:id', authMiddleware, async (req, res) => {
 });
 
 // Reset user password (authenticated, admin only)
-router.post('/:id/reset-password', authMiddleware, async (req, res) => {
+router.post('/:id/reset-password', authMiddleware, checkPermission('users', 'edit'), async (req, res) => {
   const db = req.app.locals.db;
   const { new_password } = req.body;
 
   try {
-    // Check if requester is admin
-    const requester = await db.query(
-      'SELECT is_admin FROM users WHERE id = $1 AND employer_id = $2',
-      [req.userId, req.employerId]
-    );
-
-    const isOwner = req.userId === req.employerId;
-    const isAdmin = requester.rows.length > 0 && requester.rows[0].is_admin;
-
-    if (!isOwner && !isAdmin) {
-      return res.status(403).json({ error: 'Only admins can reset passwords' });
-    }
-
     if (!new_password || new_password.length < 6) {
       return res.status(400).json({ error: 'Password must be at least 6 characters' });
     }
@@ -318,17 +245,6 @@ router.post('/:id/reset-password', authMiddleware, async (req, res) => {
 
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'User not found' });
-    }
-
-    // Log activity - only if userId exists in users table
-    try {
-      await db.query(
-        `INSERT INTO user_activity_log (user_id, employer_id, action, resource_type, resource_id)
-         VALUES ($1, $2, 'reset_password', 'user', $3)`,
-        [req.userId, req.employerId, req.params.id]
-      );
-    } catch (logError) {
-      console.log('Activity log skipped:', logError.message);
     }
 
     res.json({ success: true, message: 'Password reset successfully' });
