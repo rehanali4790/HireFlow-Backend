@@ -1,6 +1,7 @@
 const express = require('express');
 const bcrypt = require('bcrypt');
 const router = express.Router();
+const { createAuthToken } = require('../utils/auth-token');
 
 // Signup
 router.post('/signup', async (req, res) => {
@@ -31,8 +32,13 @@ router.post('/signup', async (req, res) => {
     );
     
     const employer = result.rows[0];
+    const session = createAuthToken({
+      userId: employer.id,
+      employerId: employer.id,
+      userType: 'employer',
+    });
     
-    res.status(201).json({ employer });
+    res.status(201).json({ employer, userType: 'employer', ...session });
   } catch (error) {
     console.error('Signup error:', error);
     res.status(500).json({ error: 'Failed to create account' });
@@ -69,11 +75,17 @@ router.post('/login', async (req, res) => {
       
       // Remove password hash from response
       delete employer.password_hash;
+      const session = createAuthToken({
+        userId: employer.id,
+        employerId: employer.id,
+        userType: 'employer',
+      });
       
       console.log('✅ Employer login successful for:', email);
       return res.json({ 
         employer,
-        userType: 'employer'
+        userType: 'employer',
+        ...session
       });
     }
     
@@ -132,11 +144,17 @@ router.post('/login', async (req, res) => {
       created_at: user.created_at,
       updated_at: user.updated_at
     };
+    const session = createAuthToken({
+      userId: user.id,
+      employerId: user.employer_id,
+      userType: 'user',
+    });
     
     console.log('✅ Team member login successful for:', email);
     res.json({ 
       employer: userResponse,
-      userType: 'user'
+      userType: 'user',
+      ...session
     });
   } catch (error) {
     console.error('❌ Login error:', error);

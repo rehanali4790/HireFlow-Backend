@@ -110,7 +110,8 @@ router.get('/users', authMiddleware, async (req, res) => {
       `SELECT u.id, u.first_name, u.last_name, u.email, u.department, u.designation,
               u.is_active, u.last_login,
               t.id as thread_id, t.last_message_at,
-              m.message as last_message
+              m.message as last_message,
+              COALESCE(unread.unread_count, 0)::int as unread_count
        FROM users u
        LEFT JOIN user_chat_threads t
          ON t.employer_id = u.employer_id
@@ -122,6 +123,21 @@ router.get('/users', authMiddleware, async (req, res) => {
          ORDER BY created_at DESC
          LIMIT 1
        ) m ON true
+       LEFT JOIN LATERAL (
+         SELECT COUNT(*) as unread_count
+         FROM user_chat_messages um
+         WHERE um.thread_id = t.id
+           AND um.employer_id = $1
+           AND um.sender_id != $2
+           AND um.created_at > COALESCE(
+             CASE
+               WHEN t.participant_one_id = $2 THEN t.participant_one_last_read_at
+               WHEN t.participant_two_id = $2 THEN t.participant_two_last_read_at
+               ELSE NULL
+             END,
+             TIMESTAMP '1970-01-01'
+           )
+       ) unread ON true
        WHERE u.employer_id = $1 AND u.is_active = true AND u.id != $2
        ORDER BY COALESCE(t.last_message_at, u.created_at) DESC`,
       [req.employerId, req.userId]
@@ -137,7 +153,8 @@ router.get('/users', authMiddleware, async (req, res) => {
       if (owner) {
         const pair = orderedParticipants(req.userId, req.employerId);
         const ownerThread = await db.query(
-          `SELECT t.id as thread_id, t.last_message_at, m.message as last_message
+          `SELECT t.id as thread_id, t.last_message_at, m.message as last_message,
+                  COALESCE(unread.unread_count, 0)::int as unread_count
            FROM user_chat_threads t
            LEFT JOIN LATERAL (
              SELECT message FROM user_chat_messages
@@ -145,14 +162,30 @@ router.get('/users', authMiddleware, async (req, res) => {
              ORDER BY created_at DESC
              LIMIT 1
            ) m ON true
+           LEFT JOIN LATERAL (
+             SELECT COUNT(*) as unread_count
+             FROM user_chat_messages um
+             WHERE um.thread_id = t.id
+               AND um.employer_id = $1
+               AND um.sender_id != $4
+               AND um.created_at > COALESCE(
+                 CASE
+                   WHEN t.participant_one_id = $4 THEN t.participant_one_last_read_at
+                   WHEN t.participant_two_id = $4 THEN t.participant_two_last_read_at
+                   ELSE NULL
+                 END,
+                 TIMESTAMP '1970-01-01'
+               )
+           ) unread ON true
            WHERE t.employer_id = $1 AND t.participant_one_id = $2 AND t.participant_two_id = $3`,
-          [req.employerId, pair[0], pair[1]]
+          [req.employerId, pair[0], pair[1], req.userId]
         );
         rows.unshift({
           ...owner,
           thread_id: ownerThread.rows[0]?.thread_id || null,
           last_message_at: ownerThread.rows[0]?.last_message_at || null,
           last_message: ownerThread.rows[0]?.last_message || null,
+          unread_count: ownerThread.rows[0]?.unread_count || 0,
           online: onlineUsers.has(req.employerId),
         });
       }
@@ -162,6 +195,41 @@ router.get('/users', authMiddleware, async (req, res) => {
   } catch (error) {
     console.error('Get chat users error:', error);
     res.status(500).json({ error: 'Failed to fetch chat users' });
+  }
+});
+
+router.get('/unread-count', authMiddleware, async (req, res) => {
+  const db = req.app.locals.db;
+
+  try {
+    const result = await db.query(
+      `SELECT COALESCE(SUM(thread_counts.unread_count), 0)::int as unread_count
+       FROM (
+         SELECT COUNT(m.id) as unread_count
+         FROM user_chat_threads t
+         LEFT JOIN user_chat_messages m
+           ON m.thread_id = t.id
+          AND m.employer_id = t.employer_id
+          AND m.sender_id != $2
+          AND m.created_at > COALESCE(
+            CASE
+              WHEN t.participant_one_id = $2 THEN t.participant_one_last_read_at
+              WHEN t.participant_two_id = $2 THEN t.participant_two_last_read_at
+              ELSE NULL
+            END,
+            TIMESTAMP '1970-01-01'
+          )
+         WHERE t.employer_id = $1
+           AND ($2 = t.participant_one_id OR $2 = t.participant_two_id OR $2 = $1)
+         GROUP BY t.id
+       ) thread_counts`,
+      [req.employerId, req.userId]
+    );
+
+    res.json({ unread_count: result.rows[0]?.unread_count || 0 });
+  } catch (error) {
+    console.error('Get unread chat count error:', error);
+    res.status(500).json({ error: 'Failed to fetch unread chat count' });
   }
 });
 
@@ -226,6 +294,35 @@ router.get('/user-threads/:threadId/messages', authMiddleware, async (req, res) 
   } catch (error) {
     console.error('Get user chat messages error:', error);
     res.status(500).json({ error: 'Failed to fetch chat messages' });
+  }
+});
+
+router.post('/user-threads/:threadId/read', authMiddleware, async (req, res) => {
+  const db = req.app.locals.db;
+
+  try {
+    const thread = await getUserChatThreadAccess(db, req.params.threadId, req);
+    if (!thread) {
+      return res.status(404).json({ error: 'Chat thread not found' });
+    }
+
+    const readColumn = thread.participant_one_id === req.userId
+      ? 'participant_one_last_read_at'
+      : thread.participant_two_id === req.userId
+        ? 'participant_two_last_read_at'
+        : null;
+
+    if (readColumn) {
+      await db.query(
+        `UPDATE user_chat_threads SET ${readColumn} = NOW(), updated_at = NOW() WHERE id = $1 AND employer_id = $2`,
+        [req.params.threadId, req.employerId]
+      );
+    }
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Mark chat read error:', error);
+    res.status(500).json({ error: 'Failed to mark chat as read' });
   }
 });
 

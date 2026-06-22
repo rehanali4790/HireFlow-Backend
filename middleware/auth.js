@@ -1,22 +1,26 @@
-// Enhanced auth middleware - supports both employer and user authentication
+const { verifyAuthToken } = require('../utils/auth-token');
+
+// Enhanced auth middleware - validates signed 6-hour auth tokens.
 function authMiddleware(req, res, next) {
   try {
-    const employerId = req.headers['x-employer-id'];
-    const userId = req.headers['x-user-id']; // Optional: for team member authentication
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
     
-    if (!employerId) {
-      return res.status(401).json({ error: 'No employer ID provided' });
+    if (!token) {
+      return res.status(401).json({ error: 'Authentication token required' });
     }
+
+    const payload = verifyAuthToken(token);
+    const employerId = payload.employerId;
+    const userId = payload.userId;
     
     req.employerId = employerId;
-    
-    // If userId is provided, use it; otherwise, assume it's the employer (owner)
-    // For team members, userId will be their user.id and employerId will be their employer_id
-    req.userId = userId || employerId;
+    req.userId = userId;
+    req.userType = payload.userType;
     
     next();
   } catch (error) {
-    return res.status(401).json({ error: 'Authentication failed' });
+    return res.status(401).json({ error: error.message === 'Token expired' ? 'Session expired' : 'Authentication failed' });
   }
 }
 

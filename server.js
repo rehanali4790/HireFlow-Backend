@@ -6,6 +6,7 @@ const http = require('http');
 const { Server } = require('socket.io');
 const { getPermissionResources } = require('./config/permission-catalog');
 const { auditLogMiddleware } = require('./middleware/audit-log');
+const { verifyAuthToken } = require('./utils/auth-token');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -238,11 +239,19 @@ async function ensureCandidateChatTables() {
         employer_id UUID NOT NULL,
         participant_one_id UUID NOT NULL,
         participant_two_id UUID NOT NULL,
+        participant_one_last_read_at TIMESTAMP,
+        participant_two_last_read_at TIMESTAMP,
         last_message_at TIMESTAMP DEFAULT NOW(),
         created_at TIMESTAMP DEFAULT NOW(),
         updated_at TIMESTAMP DEFAULT NOW(),
         UNIQUE (employer_id, participant_one_id, participant_two_id)
       )
+    `);
+
+    await pool.query(`
+      ALTER TABLE user_chat_threads
+      ADD COLUMN IF NOT EXISTS participant_one_last_read_at TIMESTAMP,
+      ADD COLUMN IF NOT EXISTS participant_two_last_read_at TIMESTAMP
     `);
 
     await pool.query(`
@@ -333,16 +342,18 @@ app.get('/api/health', (req, res) => {
 });
 
 io.use((socket, next) => {
-  const { employerId, userId, name, email } = socket.handshake.auth || {};
-  if (!employerId || !userId) {
-    return next(new Error('Missing socket auth'));
-  }
+  try {
+    const { token, name, email } = socket.handshake.auth || {};
+    const payload = verifyAuthToken(token);
 
-  socket.data.employerId = employerId;
-  socket.data.userId = userId;
-  socket.data.name = name || 'User';
-  socket.data.email = email || '';
-  return next();
+    socket.data.employerId = payload.employerId;
+    socket.data.userId = payload.userId;
+    socket.data.name = name || 'User';
+    socket.data.email = email || '';
+    return next();
+  } catch (error) {
+    return next(new Error('Invalid socket auth'));
+  }
 });
 
 io.on('connection', (socket) => {
