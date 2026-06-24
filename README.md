@@ -92,6 +92,8 @@ npm run db:seed
 
 ```bash
 # Development (with auto-reload)
+cd HireFlow-Backend
+npm install
 npm run dev
 
 # Production
