@@ -3,6 +3,7 @@ const authMiddleware = require('../middleware/auth');
 const { checkPermission } = require('../middleware/permissions');
 const { getActor } = require('../middleware/audit-log');
 const { generateJobContent } = require('../services/ai-service');
+const { syncJobPositions } = require('../utils/job-positions');
 const router = express.Router();
 
 // Get all jobs (public - only active, authenticated - all own jobs)
@@ -36,6 +37,21 @@ router.get('/', async (req, res) => {
     }
     
     const result = await db.query(query, params);
+
+    if (employerId) {
+      const syncedJobs = [];
+      for (const job of result.rows) {
+        const positions = await syncJobPositions(db, job.id);
+        syncedJobs.push({
+          ...job,
+          positions_available: positions?.positions_available ?? job.positions_available,
+          positions_filled: positions?.positions_filled ?? job.positions_filled,
+          status: positions?.status ?? job.status,
+        });
+      }
+      return res.json({ jobs: syncedJobs });
+    }
+
     res.json({ jobs: result.rows });
   } catch (error) {
     console.error('Get jobs error:', error);
@@ -195,6 +211,75 @@ router.put('/:id', authMiddleware, checkPermission('jobs', 'edit'), async (req, 
   } catch (error) {
     console.error('Update job error:', error);
     res.status(500).json({ error: 'Failed to update job' });
+  }
+});
+
+// Update job position openings (authenticated)
+router.patch('/:id/positions', authMiddleware, checkPermission('jobs', 'edit'), async (req, res) => {
+  const db = req.app.locals.db;
+  const { positions_available, reopen } = req.body;
+
+  try {
+    const checkResult = await db.query(
+      'SELECT id, positions_available, positions_filled, status FROM jobs WHERE id = $1 AND employer_id = $2',
+      [req.params.id, req.employerId]
+    );
+
+    if (checkResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Job not found or unauthorized' });
+    }
+
+    const actor = await getActor(db, req.userId, req.employerId);
+    const current = checkResult.rows[0];
+    const nextAvailable = Math.max(
+      Number(positions_available ?? current.positions_available) || 1,
+      1
+    );
+
+    await syncJobPositions(db, req.params.id);
+
+    const filledResult = await db.query(
+      `SELECT COUNT(*)::int AS count
+       FROM applications
+       WHERE job_id = $1 AND LOWER(status) = 'hired'`,
+      [req.params.id]
+    );
+    const positionsFilled = filledResult.rows[0]?.count || 0;
+
+    if (nextAvailable < positionsFilled) {
+      return res.status(400).json({
+        error: `Total openings cannot be less than hired count (${positionsFilled}).`,
+      });
+    }
+
+    let nextStatus = current.status;
+    const remaining = nextAvailable - positionsFilled;
+    if (remaining > 0 && nextStatus === 'closed') {
+      nextStatus = 'active';
+    }
+
+    const result = await db.query(
+      `UPDATE jobs
+       SET positions_available = $1,
+           positions_filled = $2,
+           status = $3,
+           updated_by_name = $4,
+           updated_by_email = $5,
+           updated_at = NOW()
+       WHERE id = $6
+       RETURNING *`,
+      [nextAvailable, positionsFilled, nextStatus, actor.actorName, actor.actorEmail, req.params.id]
+    );
+
+    const job = result.rows[0];
+    res.json({
+      ...job,
+      remaining: Math.max(0, nextAvailable - positionsFilled),
+      is_full: remaining === 0,
+    });
+  } catch (error) {
+    console.error('Update job positions error:', error);
+    res.status(500).json({ error: 'Failed to update job openings' });
   }
 });
 

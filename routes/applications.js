@@ -2,7 +2,24 @@ const express = require('express');
 const authMiddleware = require('../middleware/auth');
 const { checkPermission } = require('../middleware/permissions');
 const { getActor } = require('../middleware/audit-log');
+const { syncJobPositions } = require('../utils/job-positions');
 const router = express.Router();
+
+async function ensureFinalScoringTable(db) {
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS final_scoring (
+      application_id UUID PRIMARY KEY REFERENCES applications(id) ON DELETE CASCADE,
+      parameters JSONB NOT NULL DEFAULT '[]'::jsonb,
+      final_score NUMERIC(5,2) NOT NULL DEFAULT 0,
+      ai_decision TEXT,
+      recommendation VARCHAR(50),
+      updated_by_name TEXT,
+      updated_by_email TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+}
 
 async function applyApplicationUpdater(db, req, applicationId) {
   const actor = await getActor(db, req.userId, req.employerId);
@@ -324,7 +341,7 @@ router.patch('/:id/status', authMiddleware, checkPermission('applications', 'edi
   try {
     // Check if application belongs to employer's job
     const checkResult = await db.query(
-      `SELECT a.id FROM applications a
+      `SELECT a.id, a.job_id, a.status AS current_status FROM applications a
        LEFT JOIN jobs j ON a.job_id = j.id
        WHERE a.id = $1 AND j.employer_id = $2`,
       [req.params.id, req.employerId]
@@ -333,11 +350,28 @@ router.patch('/:id/status', authMiddleware, checkPermission('applications', 'edi
     if (checkResult.rows.length === 0) {
       return res.status(404).json({ error: 'Application not found' });
     }
+
+    const application = checkResult.rows[0];
+    const nextStatus = (status || '').toLowerCase();
+    const wasHired = (application.current_status || '').toLowerCase() === 'hired';
+
+    if (nextStatus === 'hired' && !wasHired) {
+      const positionState = await syncJobPositions(db, application.job_id);
+      if (positionState?.is_full) {
+        return res.status(400).json({
+          error: 'No open positions left for this job. Increase openings on the Jobs page first.',
+          positions: positionState,
+        });
+      }
+    }
     
     // Update application
     const result = await db.query(
       `UPDATE applications
-       SET status = $1, employer_notes = COALESCE($2, employer_notes), updated_at = NOW()
+       SET status = $1,
+           employer_notes = COALESCE($2, employer_notes),
+           hired_at = CASE WHEN $1 = 'hired' THEN COALESCE(hired_at, NOW()) ELSE hired_at END,
+           updated_at = NOW()
        WHERE id = $3
        RETURNING *`,
       [status, notes, req.params.id]
@@ -346,8 +380,9 @@ router.patch('/:id/status', authMiddleware, checkPermission('applications', 'edi
     result.rows[0].updated_by_name = actor.actorName;
     result.rows[0].updated_by_email = actor.actorEmail;
     result.rows[0].updated_at = new Date().toISOString();
-    
-    res.json(result.rows[0]);
+
+    const positions = await syncJobPositions(db, application.job_id);
+    res.json({ ...result.rows[0], positions });
   } catch (error) {
     console.error('Update application status error:', error);
     res.status(500).json({ error: 'Failed to update application' });
@@ -581,19 +616,32 @@ router.post('/:id/mark-hired', authMiddleware, checkPermission('applications', '
     
     const application = appResult.rows[0];
     const candidateName = `${application.first_name} ${application.last_name}`;
+    const alreadyHired = (application.status || '').toLowerCase() === 'hired';
+
+    if (!alreadyHired) {
+      const positionState = await syncJobPositions(db, application.job_id);
+      if (positionState?.is_full) {
+        return res.status(400).json({
+          error: 'No open positions left for this job. Increase openings on the Jobs page first.',
+          positions: positionState,
+        });
+      }
+    }
     
     // Update application to hired
     await db.query(
       `UPDATE applications
        SET status = 'hired',
-           hired_at = NOW(),
+           hired_at = COALESCE(hired_at, NOW()),
            updated_at = NOW()
        WHERE id = $1`,
       [req.params.id]
     );
     await applyApplicationUpdater(db, req, req.params.id);
+
+    const positions = await syncJobPositions(db, application.job_id);
     
-    console.log('✅ Candidate marked as hired');
+    console.log('✅ Candidate marked as hired', positions);
     
     // Send welcome email
     await emailService.sendEmail(
@@ -647,7 +695,11 @@ router.post('/:id/mark-hired', authMiddleware, checkPermission('applications', '
     
     console.log('✅ Welcome email sent');
     
-    res.json({ success: true, message: 'Candidate marked as hired' });
+    res.json({
+      success: true,
+      message: 'Candidate marked as hired',
+      positions,
+    });
   } catch (error) {
     console.error('Mark as hired error:', error);
     res.status(500).json({ error: 'Failed to mark as hired' });
@@ -803,9 +855,14 @@ router.post('/:id/schedule-final-interview', authMiddleware, checkPermission('ap
 router.post('/:id/final-scoring', authMiddleware, checkPermission('applications', 'edit'), async (req, res) => {
   const db = req.app.locals.db;
   const { parameters } = req.body;
-  const aiService = require('../services/ai-service');
 
   try {
+    if (!Array.isArray(parameters) || parameters.length === 0) {
+      return res.status(400).json({ error: 'At least one scoring parameter is required' });
+    }
+
+    await ensureFinalScoringTable(db);
+
     // Get application details
     const appResult = await db.query(
       `SELECT 
@@ -831,14 +888,18 @@ router.post('/:id/final-scoring', authMiddleware, checkPermission('applications'
     const application = appResult.rows[0];
 
     // Get AI interview data if available
-    const aiInterviewResult = await db.query(
-      `SELECT overall_score, communication_score, technical_score, behavioral_score
-       FROM ai_interviews
-       WHERE application_id = $1`,
-      [req.params.id]
-    );
-
-    const aiInterview = aiInterviewResult.rows[0] || null;
+    let aiInterview = null;
+    try {
+      const aiInterviewResult = await db.query(
+        `SELECT overall_score, communication_score, technical_score, problem_solving_score
+         FROM ai_interviews
+         WHERE application_id = $1`,
+        [req.params.id]
+      );
+      aiInterview = aiInterviewResult.rows[0] || null;
+    } catch (aiInterviewError) {
+      console.warn('Could not load AI interview scores for final scoring:', aiInterviewError.message);
+    }
 
     // Calculate overall score from parameters
     const totalAchieved = parameters.reduce((sum, p) => sum + p.achievedScore, 0);
@@ -873,7 +934,10 @@ Evaluation Scores:
 - AI Interview Score: ${aiInterviewScore.toFixed(1)}%
 
 Final Scoring Parameters:
-${parameters.map(p => `- ${p.name}: ${p.achievedScore}/${p.maxScore} (${((p.achievedScore/p.maxScore)*100).toFixed(1)}%)`).join('\n')}
+${parameters.map((p) => {
+  const pct = p.maxScore > 0 ? ((p.achievedScore / p.maxScore) * 100).toFixed(1) : '0.0';
+  return `- ${p.name || 'Parameter'}: ${p.achievedScore}/${p.maxScore} (${pct}%)`;
+}).join('\n')}
 
 Overall Final Score: ${finalScore.toFixed(1)}%
 
@@ -953,7 +1017,7 @@ Keep the response professional, concise, and actionable.`;
     });
   } catch (error) {
     console.error('Final scoring error:', error);
-    res.status(500).json({ error: 'Failed to process final scoring' });
+    res.status(500).json({ error: error.message || 'Failed to process final scoring' });
   }
 });
 
@@ -962,6 +1026,8 @@ router.get('/:id/final-scoring', authMiddleware, checkPermission('applications',
   const db = req.app.locals.db;
 
   try {
+    await ensureFinalScoringTable(db);
+
     const result = await db.query(
       `SELECT parameters, final_score, ai_decision, recommendation,
               updated_by_name, updated_by_email, created_at, updated_at

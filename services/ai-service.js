@@ -199,6 +199,8 @@ ${conversationHistory.map(m => `${m.role}: ${m.content}`).join('\n\n')}
 
 MAKE A DECISION NOW:
 
+Note: The candidate may answer in English, Urdu, or both. Judge qualification based on technical substance, not language.
+
 1. If candidate is CLEARLY NOT QUALIFIED:
    - Vague, generic answers
    - No relevant experience
@@ -258,6 +260,12 @@ Respond ONLY with JSON:
   const systemPrompt = `You are a Senior Technical Interviewer conducting a professional technical interview. Act like a real person having a conversation, not a robot.
 
 This interview will have EXACTLY ${maxQuestions} questions total. You are currently on question ${questionNumber}.
+
+LANGUAGE POLICY:
+- Ask all questions in clear, professional English.
+- The candidate may answer in English, Urdu (اردو), Roman Urdu, or a mix of these languages.
+- When reading the conversation history, fully understand and interpret Urdu answers.
+- Do not ask the candidate to switch languages.
 
 Your interviewing style:
 - Ask questions naturally, like a real interview conversation
@@ -325,6 +333,12 @@ Requirements: ${JSON.stringify(jobRequirements)}
 
 FULL TRANSCRIPT:
 ${fullTranscript}
+
+LANGUAGE POLICY:
+- The candidate may have answered in English, Urdu (اردو), Roman Urdu, or a mix.
+- Evaluate technical knowledge, problem-solving, and communication based on the content of their answers.
+- Do NOT penalize the candidate for answering in Urdu or mixing languages.
+- If an answer is in Urdu, assess whether the technical substance is correct and clearly explained.
 
 Evaluate the candidate on:
 1. Technical Knowledge (0-100): Deep understanding of required technologies and concepts

@@ -184,6 +184,35 @@ router.post('/:id/submit', async (req, res) => {
     if (testResult.rows.length === 0) {
       return res.status(404).json({ error: 'Test not found' });
     }
+
+    const cancelledAttempt = await db.query(
+      `SELECT id, is_expired, submitted_at, extension_reason
+       FROM test_attempts
+       WHERE application_id = $1 AND test_id = $2`,
+      [applicationId, req.params.id]
+    );
+
+    if (cancelledAttempt.rows.length > 0) {
+      const attempt = cancelledAttempt.rows[0];
+      if (attempt.is_expired && !attempt.submitted_at) {
+        return res.status(403).json({
+          error: 'Test attempt was cancelled. Please contact HR for retake approval.',
+          cancelled: true,
+        });
+      }
+    }
+
+    const applicationResult = await db.query(
+      'SELECT status FROM applications WHERE id = $1',
+      [applicationId]
+    );
+
+    if (applicationResult.rows[0]?.status === 'test_cancelled') {
+      return res.status(403).json({
+        error: 'Test was cancelled due to a proctoring violation. Please contact HR for retake approval.',
+        cancelled: true,
+      });
+    }
     
     const test = testResult.rows[0];
     
@@ -378,7 +407,7 @@ router.post('/:id/cancel', async (req, res) => {
 
     await db.query(
       `UPDATE applications
-       SET status = 'testing',
+       SET status = 'test_cancelled',
            rejection_reason = $1,
            updated_at = NOW()
        WHERE id = $2`,
@@ -689,7 +718,9 @@ router.post('/send-invitation', authMiddleware, checkPermission('tests', 'write'
     // Update application status
     await db.query(
       `UPDATE applications 
-       SET status = 'testing', updated_at = NOW()
+       SET status = 'testing',
+           rejection_reason = NULL,
+           updated_at = NOW()
        WHERE id = $1`,
       [applicationId]
     );
@@ -727,6 +758,19 @@ router.get('/check-expiration/:testId', async (req, res) => {
     
     if (attemptResult.rows.length === 0) {
       // No attempt yet - link is valid
+      const applicationResult = await db.query(
+        'SELECT status FROM applications WHERE id = $1',
+        [application]
+      );
+
+      if (applicationResult.rows[0]?.status === 'test_cancelled') {
+        return res.status(403).json({
+          expired: true,
+          cancelled: true,
+          message: 'This test was cancelled due to a proctoring violation. Please contact HR for retake approval.',
+        });
+      }
+
       return res.json({ expired: false, valid: true });
     }
     
@@ -839,6 +883,15 @@ router.post('/extend-link/:applicationId', authMiddleware, checkPermission('test
            updated_at = NOW()
        WHERE id = $3`,
       [newExpiresAt, reason || 'Extended by HR', attempt.id]
+    );
+
+    await db.query(
+      `UPDATE applications
+       SET status = 'testing',
+           rejection_reason = NULL,
+           updated_at = NOW()
+       WHERE id = $1`,
+      [applicationId]
     );
     
     console.log(`✅ Test link extended for application ${applicationId} until ${newExpiresAt}`);
