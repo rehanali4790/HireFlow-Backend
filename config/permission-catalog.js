@@ -1,6 +1,7 @@
 const permissionResources = [
   { id: 'overview', name: 'Overview', description: 'Overview page access', category: 'page', sort_order: 10 },
   { id: 'jobs', name: 'Jobs', description: 'Jobs page access', category: 'page', sort_order: 20 },
+  { id: 'requisitions', name: 'Requisitions', description: 'Submit and review job requisition requests', category: 'page', sort_order: 25 },
   { id: 'applications', name: 'Approvals', description: 'Approvals page access', category: 'page', sort_order: 30 },
   { id: 'candidates', name: 'Candidates', description: 'Candidates page access', category: 'page', sort_order: 40 },
   { id: 'tests', name: 'Tests', description: 'Tests page access', category: 'page', sort_order: 50 },

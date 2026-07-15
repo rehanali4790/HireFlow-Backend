@@ -79,8 +79,12 @@ CREATE DATABASE hireflow_db;
 ### 4. Run Database Schema
 
 ```bash
+npm run db:create
 npm run db:setup
+npm run db:migrate
 ```
+
+`db:migrate` applies all incremental SQL migrations (test expiration, users/RBAC, AI interview columns, pipeline stages, etc.). The server also runs these migrations automatically on startup.
 
 ### 5. Seed Demo Data (Optional)
 

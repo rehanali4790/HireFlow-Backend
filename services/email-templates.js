@@ -444,7 +444,7 @@ function getAIInterviewTemplate(industry, candidateName, jobTitle, interviewLink
               <h3>🎯 Interview Details</h3>
               <div class="detail-row">
                 <span class="detail-label">Format:</span>
-                <span class="detail-value">AI-Powered Voice Interview</span>
+                <span class="detail-value">cs Voice Interview</span>
               </div>
               <div class="detail-row">
                 <span class="detail-label">Duration:</span>
@@ -568,9 +568,22 @@ function getShortlistTemplate(industry, candidateName, jobTitle, companyName, ne
 
 /**
  * Rejection Email Template
+ * @param {string} [hrMessage] Optional personal note from HR (shown in email if provided)
  */
-function getRejectionTemplate(industry, candidateName, jobTitle, companyName) {
+function getRejectionTemplate(industry, candidateName, jobTitle, companyName, hrMessage = '') {
   const styles = getIndustryStyles(industry);
+  const safeMessage = String(hrMessage || '').trim();
+  const messageBlock = safeMessage
+    ? `
+            <div class="info-box" style="margin: 20px 0; border-left: 4px solid #64748B;">
+              <strong>A note from our hiring team:</strong>
+              <p style="margin: 10px 0 0 0; white-space: pre-wrap; color: #334155; line-height: 1.55;">${safeMessage
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')}</p>
+            </div>`
+    : '';
   
   return `
     <!DOCTYPE html>
@@ -592,7 +605,7 @@ function getRejectionTemplate(industry, candidateName, jobTitle, companyName) {
             <p>Thank you for your interest in the <strong>${jobTitle}</strong> position at <strong>${companyName}</strong> and for taking the time to apply.</p>
             
             <p>After careful consideration of all applications, we have decided to move forward with other candidates whose qualifications more closely match our current needs for this specific role.</p>
-            
+            ${messageBlock}
             <div class="info-box">
               <strong>This decision does not reflect on your abilities or potential.</strong>
               <p style="margin: 8px 0 0 0; color: #1E40AF;">We received many strong applications, and the selection process was highly competitive.</p>

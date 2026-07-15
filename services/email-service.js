@@ -126,10 +126,11 @@ async function sendShortlistEmail(candidateEmail, candidateName, jobTitle, compa
 
 /**
  * Send rejection email
+ * @param {string} [hrMessage] Optional personal note from HR included in the email
  */
-async function sendRejectionEmail(candidateEmail, candidateName, jobTitle, companyName, industry = 'other') {
+async function sendRejectionEmail(candidateEmail, candidateName, jobTitle, companyName, industry = 'other', hrMessage = '') {
   const subject = `Application Update - ${jobTitle}`;
-  const html = getRejectionTemplate(industry, candidateName, jobTitle, companyName);
+  const html = getRejectionTemplate(industry, candidateName, jobTitle, companyName, hrMessage);
   
   return sendEmail(candidateEmail, subject, html);
 }

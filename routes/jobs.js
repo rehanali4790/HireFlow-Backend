@@ -4,6 +4,7 @@ const { checkPermission } = require('../middleware/permissions');
 const { getActor } = require('../middleware/audit-log');
 const { generateJobContent } = require('../services/ai-service');
 const { syncJobPositions } = require('../utils/job-positions');
+const { getJobPrescreeningSettings, getDefaultPrescreeningSettings, saveJobPrescreeningSettings } = require('./prescreening');
 const router = express.Router();
 
 // Get all jobs (public - only active, authenticated - all own jobs)
@@ -75,8 +76,27 @@ router.get('/:id', async (req, res) => {
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Job not found' });
     }
-    
-    res.json(result.rows[0]);
+
+    const job = result.rows[0];
+    let allSettings = await getJobPrescreeningSettings(db, req.params.id);
+
+    if (allSettings.length === 0) {
+      allSettings = await getDefaultPrescreeningSettings(db);
+    }
+
+    const prescreeningQuestions = allSettings
+      .filter((s) => s.is_enabled)
+      .map((s) => ({
+        id: s.question_id,
+        question_text: s.question_text,
+        question_type: s.question_type,
+        options: s.options,
+        is_required: s.is_required,
+        is_predefined: s.is_predefined,
+        sort_order: s.sort_order,
+      }));
+
+    res.json({ ...job, prescreening_questions: prescreeningQuestions });
   } catch (error) {
     console.error('Get job error:', error);
     res.status(500).json({ error: 'Failed to fetch job' });
@@ -120,6 +140,7 @@ router.post('/', authMiddleware, checkPermission('jobs', 'write'), async (req, r
     status,
     application_deadline,
     positions_available,
+    prescreening_settings,
   } = req.body;
   
   try {
@@ -156,7 +177,27 @@ router.post('/', authMiddleware, checkPermission('jobs', 'write'), async (req, r
       ]
     );
     
-    res.status(201).json(result.rows[0]);
+    const createdJob = result.rows[0];
+
+    if (Array.isArray(prescreening_settings) && prescreening_settings.length > 0) {
+      await saveJobPrescreeningSettings(db, createdJob.id, prescreening_settings);
+    } else {
+      // Default: enable all predefined questions as optional
+      const defaultQuestions = await db.query(
+        `SELECT id, sort_order FROM prescreening_questions
+         WHERE is_predefined = true
+         ORDER BY sort_order ASC`
+      );
+      const defaultSettings = defaultQuestions.rows.map((q, i) => ({
+        question_id: q.id,
+        is_enabled: true,
+        is_required: false,
+        sort_order: i,
+      }));
+      await saveJobPrescreeningSettings(db, createdJob.id, defaultSettings);
+    }
+
+    res.status(201).json(createdJob);
   } catch (error) {
     console.error('Create job error:', error);
     res.status(500).json({ error: 'Failed to create job' });
@@ -182,9 +223,11 @@ router.put('/:id', authMiddleware, checkPermission('jobs', 'edit'), async (req, 
     const updates = [];
     const values = [];
     let paramCount = 1;
+    const prescreeningSettings = req.body.prescreening_settings;
     
     // Build dynamic update query
     Object.keys(req.body).forEach(key => {
+      if (key === 'prescreening_settings') return;
       if (req.body[key] !== undefined) {
         updates.push(`${key} = $${paramCount}`);
         values.push(req.body[key]);
@@ -207,6 +250,10 @@ router.put('/:id', authMiddleware, checkPermission('jobs', 'edit'), async (req, 
       values
     );
     
+    if (Array.isArray(prescreeningSettings)) {
+      await saveJobPrescreeningSettings(db, req.params.id, prescreeningSettings);
+    }
+
     res.json(result.rows[0]);
   } catch (error) {
     console.error('Update job error:', error);

@@ -7,6 +7,7 @@ const { Server } = require('socket.io');
 const { getPermissionResources } = require('./config/permission-catalog');
 const { auditLogMiddleware } = require('./middleware/audit-log');
 const { verifyAuthToken } = require('./utils/auth-token');
+const { runSqlMigrations } = require('./scripts/sql-migrations');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -28,26 +29,24 @@ const pool = new Pool({
   password: process.env.DB_PASSWORD,
 });
 
-// Test database connection
-pool.query('SELECT NOW()', (err, res) => {
-  if (err) {
-    console.error('❌ Database connection failed:', err.message);
-  } else {
-    console.log('✅ Database connected successfully');
+async function ensurePgcryptoExtension() {
+  try {
+    await pool.query('CREATE EXTENSION IF NOT EXISTS pgcrypto');
+  } catch (err) {
+    // Safe to ignore if another connection created the extension first.
+    if (err.code !== '23505') throw err;
   }
-});
+}
 
-// Lightweight compatibility migration for per-candidate pipeline skips
-pool.query(`
-  ALTER TABLE applications
-  ADD COLUMN IF NOT EXISTS skip_test BOOLEAN DEFAULT false,
-  ADD COLUMN IF NOT EXISTS skip_ai_interview BOOLEAN DEFAULT false,
-  ADD COLUMN IF NOT EXISTS skip_final_interview BOOLEAN DEFAULT false
-`).then(() => {
+async function ensurePipelineSkipColumns() {
+  await pool.query(`
+    ALTER TABLE applications
+    ADD COLUMN IF NOT EXISTS skip_test BOOLEAN DEFAULT false,
+    ADD COLUMN IF NOT EXISTS skip_ai_interview BOOLEAN DEFAULT false,
+    ADD COLUMN IF NOT EXISTS skip_final_interview BOOLEAN DEFAULT false
+  `);
   console.log('✅ Application pipeline skip columns ready');
-}).catch((err) => {
-  console.error('⚠️ Failed to ensure pipeline skip columns:', err.message);
-});
+}
 
 async function ensurePermissionCatalog() {
   const resources = getPermissionResources();
@@ -87,12 +86,8 @@ async function ensurePermissionCatalog() {
   }
 }
 
-ensurePermissionCatalog();
-
 async function ensureActivityLog() {
   try {
-    await pool.query('CREATE EXTENSION IF NOT EXISTS pgcrypto');
-
     await pool.query(`
       CREATE TABLE IF NOT EXISTS user_activity_log (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -132,8 +127,6 @@ async function ensureActivityLog() {
   }
 }
 
-ensureActivityLog();
-
 async function ensureFinalScoringMetadata() {
   try {
     await pool.query(`
@@ -164,8 +157,6 @@ async function ensureFinalScoringMetadata() {
   }
 }
 
-ensureFinalScoringMetadata();
-
 async function ensureTenantUpdateMetadata() {
   try {
     for (const table of ['jobs', 'tests', 'applications', 'candidates']) {
@@ -182,16 +173,16 @@ async function ensureTenantUpdateMetadata() {
   }
 }
 
-ensureTenantUpdateMetadata();
-
 async function ensureCandidateChatTables() {
   try {
-    await pool.query('CREATE EXTENSION IF NOT EXISTS pgcrypto');
-    await pool.query(`
-      ALTER TABLE users
-      ADD COLUMN IF NOT EXISTS department TEXT,
-      ADD COLUMN IF NOT EXISTS designation TEXT
-    `);
+    const usersTable = await pool.query(`SELECT to_regclass('public.users') AS table_name`);
+    if (usersTable.rows[0].table_name) {
+      await pool.query(`
+        ALTER TABLE users
+        ADD COLUMN IF NOT EXISTS department TEXT,
+        ADD COLUMN IF NOT EXISTS designation TEXT
+      `);
+    }
 
     await pool.query(`
       CREATE TABLE IF NOT EXISTS candidate_chat_threads (
@@ -283,7 +274,28 @@ async function ensureCandidateChatTables() {
   }
 }
 
-ensureCandidateChatTables();
+async function initializeDatabase() {
+  try {
+    await pool.query('SELECT NOW()');
+    console.log('✅ Database connected successfully');
+
+    await ensurePgcryptoExtension();
+    await runSqlMigrations(pool, {
+      log: (message) => console.log(message),
+      warn: (message) => console.warn(message),
+    });
+    await ensurePipelineSkipColumns();
+    await ensurePermissionCatalog();
+    await ensureActivityLog();
+    await ensureFinalScoringMetadata();
+    await ensureTenantUpdateMetadata();
+    await ensureCandidateChatTables();
+  } catch (err) {
+    console.error('❌ Database initialization failed:', err.message);
+  }
+}
+
+initializeDatabase();
 
 // Middleware
 app.use(cors({
@@ -315,9 +327,12 @@ app.use('/api/employers', require('./routes/employers'));
 app.use('/api/users', require('./routes/users'));
 app.use('/api/roles', require('./routes/roles'));
 app.use('/api/activity', require('./routes/activity'));
+app.use('/api/prescreening', require('./routes/prescreening').router);
 app.use('/api/jobs', require('./routes/jobs'));
 app.use('/api/applications', require('./routes/applications'));
 app.use('/api/candidates', require('./routes/candidates'));
+app.use('/api/blacklist', require('./routes/blacklist'));
+app.use('/api/requisitions', require('./routes/requisitions'));
 app.use('/api/tests', require('./routes/tests'));
 app.use('/api/interviews', require('./routes/interviews'));
 app.use('/api/ai-interviews', require('./routes/ai-interviews'));

@@ -77,6 +77,7 @@ CREATE TABLE IF NOT EXISTS applications (
   candidate_id uuid REFERENCES candidates(id) ON DELETE CASCADE NOT NULL,
   status text DEFAULT 'applied',
   current_stage text DEFAULT 'application_received',
+  referred_by text,
   application_date timestamptz DEFAULT now(),
   screening_completed_at timestamptz,
   shortlist_approved_at timestamptz,
@@ -145,6 +146,11 @@ CREATE TABLE IF NOT EXISTS test_attempts (
   percentage numeric DEFAULT 0,
   passed boolean DEFAULT false,
   feedback text,
+  link_sent_at timestamptz,
+  link_expires_at timestamptz,
+  link_extended_at timestamptz,
+  extension_reason text,
+  is_expired boolean DEFAULT false,
   created_at timestamptz DEFAULT now(),
   UNIQUE(application_id, test_id)
 );

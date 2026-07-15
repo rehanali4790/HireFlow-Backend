@@ -3,7 +3,51 @@ const authMiddleware = require('../middleware/auth');
 const { checkPermission } = require('../middleware/permissions');
 const { getActor } = require('../middleware/audit-log');
 const { syncJobPositions } = require('../utils/job-positions');
+const {
+  PIPELINE_STAGES,
+  MOVE_TARGETS,
+  statusToStage,
+  ensurePipelineEventsTable,
+  logPipelineEvent,
+} = require('../utils/pipeline-events');
 const router = express.Router();
+
+function isRejectedStatus(status) {
+  const s = (status || '').toLowerCase();
+  return s === 'rejected' || s.startsWith('rejected_') || s === 'test_cancelled' || s === 'ai_interview_cancelled';
+}
+
+/** Fire-and-forget rejection email to candidate (optional HR message in body) */
+async function sendRejectionEmailForApplication(db, applicationId, employerId, rejectionMessage = '') {
+  const emailService = require('../services/email-service');
+  const result = await db.query(
+    `SELECT c.email AS candidate_email, c.first_name, c.last_name,
+            j.title AS job_title, e.company_name, e.industry
+     FROM applications a
+     LEFT JOIN candidates c ON a.candidate_id = c.id
+     LEFT JOIN jobs j ON a.job_id = j.id
+     LEFT JOIN employers e ON j.employer_id = e.id
+     WHERE a.id = $1 AND j.employer_id = $2`,
+    [applicationId, employerId]
+  );
+  if (result.rows.length === 0) return;
+  const row = result.rows[0];
+  if (!row.candidate_email) {
+    console.warn(`⚠️ No candidate email for application ${applicationId} — skip rejection email`);
+    return;
+  }
+  const candidateName = `${row.first_name || ''} ${row.last_name || ''}`.trim() || 'Candidate';
+  emailService
+    .sendRejectionEmail(
+      row.candidate_email,
+      candidateName,
+      row.job_title || 'the position',
+      row.company_name || 'HireFlow',
+      row.industry || 'other',
+      rejectionMessage || ''
+    )
+    .catch((err) => console.error('❌ Error sending rejection email:', err));
+}
 
 async function ensureFinalScoringTable(db) {
   await db.query(`
@@ -45,13 +89,23 @@ router.get('/', authMiddleware, checkPermission('applications', 'read'), async (
               j.title as job_title, j.location as job_location,
               rs.overall_score, rs.recommendation,
               ta.passed as test_passed, ta.score as test_score, 
-              ta.max_score as test_max_score, ta.percentage as test_percentage
+              ta.max_score as test_max_score, ta.percentage as test_percentage,
+              fs.final_score, fs.recommendation as final_scoring_recommendation,
+              fs.updated_at as final_scoring_updated_at
        FROM applications a
        LEFT JOIN candidates c ON a.candidate_id = c.id
        LEFT JOIN jobs j ON a.job_id = j.id
        LEFT JOIN resume_scores rs ON a.id = rs.application_id
        LEFT JOIN test_attempts ta ON a.id = ta.application_id
+       LEFT JOIN final_scoring fs ON a.id = fs.application_id
        WHERE j.employer_id = $1
+         AND lower(COALESCE(a.status, '')) <> 'blacklisted'
+         AND NOT EXISTS (
+           SELECT 1 FROM candidate_blacklist b
+           WHERE b.employer_id = $1
+             AND b.candidate_id = a.candidate_id
+             AND b.removed_at IS NULL
+         )
        ORDER BY a.application_date DESC`,
       [req.employerId]
     );
@@ -60,6 +114,113 @@ router.get('/', authMiddleware, checkPermission('applications', 'read'), async (
   } catch (error) {
     console.error('Get applications error:', error);
     res.status(500).json({ error: 'Failed to fetch applications' });
+  }
+});
+
+// Pipeline analytics funnel (must be before /:id)
+router.get('/pipeline-analytics', authMiddleware, checkPermission('applications', 'read'), async (req, res) => {
+  const db = req.app.locals.db;
+  const jobId = req.query.job_id || null;
+
+  try {
+    await ensurePipelineEventsTable(db);
+
+    const appsResult = await db.query(
+      `SELECT a.id, a.status, a.job_id, a.interview_date, a.interview_time,
+              a.final_interview_scheduled_at, a.hired_at, a.skip_test, a.skip_ai_interview, a.skip_final_interview,
+              a.application_date, a.updated_at, a.updated_by_name, a.updated_by_email,
+              c.first_name, c.last_name, c.email, c.phone, c.skills, c.resume_url, c.picture_url,
+              j.title as job_title,
+              rs.overall_score,
+              ta.passed as test_passed, ta.score as test_score, ta.percentage as test_percentage,
+              ai.id as ai_interview_id, ai.overall_score as ai_overall_score, ai.completed_at as ai_completed_at,
+              ai.recommendation as ai_recommendation
+       FROM applications a
+       LEFT JOIN candidates c ON a.candidate_id = c.id
+       LEFT JOIN jobs j ON a.job_id = j.id
+       LEFT JOIN resume_scores rs ON a.id = rs.application_id
+       LEFT JOIN LATERAL (
+         SELECT * FROM test_attempts t WHERE t.application_id = a.id ORDER BY t.created_at DESC NULLS LAST LIMIT 1
+       ) ta ON true
+       LEFT JOIN LATERAL (
+         SELECT * FROM ai_interviews i WHERE i.application_id = a.id ORDER BY i.created_at DESC NULLS LAST LIMIT 1
+       ) ai ON true
+       WHERE j.employer_id = $1
+         AND ($2::uuid IS NULL OR a.job_id = $2::uuid)
+         AND lower(COALESCE(a.status, '')) <> 'blacklisted'
+         AND NOT EXISTS (
+           SELECT 1 FROM candidate_blacklist b
+           WHERE b.employer_id = $1
+             AND b.candidate_id = a.candidate_id
+             AND b.removed_at IS NULL
+         )
+       ORDER BY a.application_date DESC`,
+      [req.employerId, jobId]
+    );
+
+    const applications = appsResult.rows;
+
+    const stageStats = PIPELINE_STAGES.map((stage) => {
+      const current = applications.filter((a) => stage.statuses.includes((a.status || '').toLowerCase()));
+      return {
+        id: stage.id,
+        label: stage.label,
+        statuses: stage.statuses,
+        current_count: current.length,
+        hired_in_bucket: current.filter((a) => (a.status || '').toLowerCase() === 'hired').length,
+      };
+    });
+
+    // Historical pass-through from events
+    const eventsAgg = await db.query(
+      `SELECT e.stage, e.action, COUNT(*)::int AS count
+       FROM application_pipeline_events e
+       JOIN applications a ON a.id = e.application_id
+       JOIN jobs j ON j.id = a.job_id
+       WHERE j.employer_id = $1
+         AND ($2::uuid IS NULL OR a.job_id = $2::uuid)
+       GROUP BY e.stage, e.action`,
+      [req.employerId, jobId]
+    );
+
+    const historyByStage = {};
+    for (const row of eventsAgg.rows) {
+      if (!historyByStage[row.stage]) historyByStage[row.stage] = { completed: 0, skipped: 0, moved: 0, started: 0 };
+      if (row.action === 'completed') historyByStage[row.stage].completed = row.count;
+      else if (row.action === 'skipped') historyByStage[row.stage].skipped = row.count;
+      else if (row.action === 'moved') historyByStage[row.stage].moved = row.count;
+      else if (row.action === 'started') historyByStage[row.stage].started = row.count;
+    }
+
+    // Derived activity counts from related tables (visible even without events)
+    const derived = {
+      tests_taken: applications.filter((a) => a.test_score != null || a.test_percentage != null || a.test_passed != null).length,
+      tests_passed: applications.filter((a) => a.test_passed === true).length,
+      ai_interviews: applications.filter((a) => a.ai_interview_id).length,
+      ai_completed: applications.filter((a) => a.ai_completed_at).length,
+      hr_interviews_scheduled: applications.filter((a) => a.interview_date || a.final_interview_scheduled_at).length,
+      hired: applications.filter((a) => (a.status || '').toLowerCase() === 'hired').length,
+      rejected: applications.filter((a) => statusToStage(a.status) === 'rejected').length,
+      on_hold: applications.filter((a) => statusToStage(a.status) === 'on_hold').length,
+      call_screening: applications.filter((a) => statusToStage(a.status) === 'call').length,
+      hod_interview: applications.filter((a) => statusToStage(a.status) === 'hod_interview').length,
+    };
+
+    const stages = stageStats.map((s) => ({
+      ...s,
+      history: historyByStage[s.id] || { completed: 0, skipped: 0, moved: 0, started: 0 },
+    }));
+
+    res.json({
+      total: applications.length,
+      stages,
+      derived,
+      move_targets: MOVE_TARGETS,
+      applications,
+    });
+  } catch (error) {
+    console.error('Pipeline analytics error:', error);
+    res.status(500).json({ error: 'Failed to load pipeline analytics', message: error.message });
   }
 });
 
@@ -76,6 +237,8 @@ router.get('/:id', authMiddleware, checkPermission('applications', 'read'), asyn
         a.status,
         a.current_stage,
         a.application_date,
+        a.interview_date,
+        a.interview_time,
         a.overall_score as application_overall_score,
         a.employer_notes,
         a.rejection_reason,
@@ -123,8 +286,22 @@ router.get('/:id', authMiddleware, checkPermission('applications', 'read'), asyn
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Application not found' });
     }
-    
-    res.json(result.rows[0]);
+
+    const application = result.rows[0];
+
+    const prescreeningResult = await db.query(
+      `SELECT apa.*, pq.question_type, pq.is_predefined
+       FROM application_prescreening_answers apa
+       LEFT JOIN prescreening_questions pq ON pq.id = apa.question_id
+       WHERE apa.application_id = $1
+       ORDER BY apa.created_at ASC`,
+      [req.params.id]
+    );
+
+    res.json({
+      ...application,
+      prescreening_answers: prescreeningResult.rows,
+    });
   } catch (error) {
     console.error('Get application error:', error);
     res.status(500).json({ error: 'Failed to fetch application' });
@@ -157,7 +334,11 @@ router.post('/', async (req, res) => {
     resumeText,
     certifications,
     education,
+    prescreeningAnswers,
+    referredBy,
   } = req.body;
+
+  const referredByName = typeof referredBy === 'string' ? referredBy.trim() : '';
   
   try {
     // Check if job exists and is active
@@ -172,6 +353,26 @@ router.post('/', async (req, res) => {
     
     if (jobCheck.rows[0].status !== 'active') {
       return res.status(400).json({ error: 'Job is not accepting applications' });
+    }
+
+    // Validate prescreening answers for enabled required questions
+    const { getEnabledPrescreeningForJob } = require('./prescreening');
+    const enabledQuestions = await getEnabledPrescreeningForJob(db, jobId);
+    const answersMap = {};
+    if (Array.isArray(prescreeningAnswers)) {
+      prescreeningAnswers.forEach((a) => {
+        if (a.question_id) answersMap[a.question_id] = a.answer;
+      });
+    }
+
+    for (const q of enabledQuestions) {
+      if (!q.is_required) continue;
+      const answer = answersMap[q.question_id];
+      if (!answer || !String(answer).trim()) {
+        return res.status(400).json({
+          error: `Please answer the required prescreening question: "${q.question_text}"`,
+        });
+      }
     }
     
     // Check if candidate already exists
@@ -223,18 +424,92 @@ router.post('/', async (req, res) => {
     if (existingApplication.rows.length > 0) {
       return res.status(409).json({ error: 'Already applied to this job' });
     }
+
+    // Blacklist guard: keep application for audit, but never enter hiring pipeline
+    const jobEmployer = await db.query(
+      'SELECT employer_id, title FROM jobs WHERE id = $1',
+      [jobId]
+    );
+    const employerIdForJob = jobEmployer.rows[0]?.employer_id;
+    const { findActiveBlacklist, logBlacklistEvent } = require('./blacklist');
+    const activeBlacklist = employerIdForJob
+      ? await findActiveBlacklist(db, employerIdForJob, {
+          candidateId,
+          email,
+          phone,
+        })
+      : null;
+
+    const initialStatus = activeBlacklist ? 'blacklisted' : 'new';
+    const initialStage = activeBlacklist ? 'blacklisted' : 'application_received';
     
     // Create application
     const applicationResult = await db.query(
       `INSERT INTO applications (
-        job_id, candidate_id, status, current_stage,
+        job_id, candidate_id, status, current_stage, referred_by,
         application_date, created_at, updated_at
-      ) VALUES ($1, $2, 'applied', 'application_received', NOW(), NOW(), NOW())
+      ) VALUES ($1, $2, $3, $4, $5, NOW(), NOW(), NOW())
       RETURNING *`,
-      [jobId, candidateId]
+      [jobId, candidateId, initialStatus, initialStage, referredByName || null]
     );
     
     const application = applicationResult.rows[0];
+
+    if (activeBlacklist) {
+      await logBlacklistEvent(db, {
+        employerId: employerIdForJob,
+        candidateId,
+        applicationId: application.id,
+        action: 'reapply_blocked',
+        reason: activeBlacklist.reason,
+        actorName: 'System',
+        actorEmail: null,
+        metadata: {
+          job_id: jobId,
+          job_title: jobEmployer.rows[0]?.title || null,
+          blacklist_id: activeBlacklist.id,
+        },
+      });
+
+      try {
+        const { logPipelineEvent } = require('../utils/pipeline-events');
+        await logPipelineEvent(db, {
+          applicationId: application.id,
+          stage: 'blacklisted',
+          action: 'reapply_blocked',
+          fromStatus: null,
+          toStatus: 'blacklisted',
+          outcome: 'blacklisted',
+          notes: `Re-apply blocked: ${activeBlacklist.reason}`,
+          actorName: 'System',
+          metadata: { blacklist_id: activeBlacklist.id },
+        });
+      } catch (logErr) {
+        console.warn('Blacklist pipeline log skipped:', logErr.message);
+      }
+    }
+
+    // Save prescreening answers
+    if (enabledQuestions.length > 0) {
+      for (const q of enabledQuestions) {
+        const answer = answersMap[q.question_id] || null;
+        await db.query(
+          `INSERT INTO application_prescreening_answers (
+            application_id, question_id, question_text, answer, is_required
+          ) VALUES ($1, $2, $3, $4, $5)`,
+          [application.id, q.question_id, q.question_text, answer, q.is_required]
+        );
+      }
+    }
+
+    // Blacklisted re-applies stay out of hiring pipeline (no AI scoring / no confirmation funnel)
+    if (activeBlacklist) {
+      return res.status(201).json({
+        ...application,
+        blacklisted: true,
+        message: 'Application received but candidate is blacklisted. It will not enter the hiring pipeline.',
+      });
+    }
     
     // Trigger AI resume scoring (async, don't wait)
     const aiService = require('../services/ai-service');
@@ -287,10 +562,10 @@ router.post('/', async (req, res) => {
           ]
         );
         
-        // Update application
+        // Keep pipeline status as 'new' until HR takes an action
         await db.query(
           `UPDATE applications
-           SET overall_score = $1, status = 'screening', screening_completed_at = NOW()
+           SET overall_score = $1, screening_completed_at = NOW()
            WHERE id = $2`,
           [analysis.overall_score, application.id]
         );
@@ -336,7 +611,7 @@ router.post('/', async (req, res) => {
 // Update application status (authenticated)
 router.patch('/:id/status', authMiddleware, checkPermission('applications', 'edit'), async (req, res) => {
   const db = req.app.locals.db;
-  const { status, notes } = req.body;
+  const { status, notes, rejectionMessage } = req.body;
   
   try {
     // Check if application belongs to employer's job
@@ -354,6 +629,7 @@ router.patch('/:id/status', authMiddleware, checkPermission('applications', 'edi
     const application = checkResult.rows[0];
     const nextStatus = (status || '').toLowerCase();
     const wasHired = (application.current_status || '').toLowerCase() === 'hired';
+    const hrMessage = typeof rejectionMessage === 'string' ? rejectionMessage.trim() : '';
 
     if (nextStatus === 'hired' && !wasHired) {
       const positionState = await syncJobPositions(db, application.job_id);
@@ -366,26 +642,209 @@ router.patch('/:id/status', authMiddleware, checkPermission('applications', 'edi
     }
     
     // Update application
+    const previousStatus = application.current_status;
     const result = await db.query(
       `UPDATE applications
        SET status = $1,
            employer_notes = COALESCE($2, employer_notes),
+           rejection_reason = CASE
+             WHEN $1::text ILIKE 'rejected%' AND $4::text IS NOT NULL AND LENGTH(TRIM($4::text)) > 0
+             THEN TRIM($4::text)
+             ELSE rejection_reason
+           END,
            hired_at = CASE WHEN $1 = 'hired' THEN COALESCE(hired_at, NOW()) ELSE hired_at END,
            updated_at = NOW()
        WHERE id = $3
        RETURNING *`,
-      [status, notes, req.params.id]
+      [status, notes, req.params.id, isRejectedStatus(nextStatus) ? (hrMessage || notes || null) : null]
     );
     const actor = await applyApplicationUpdater(db, req, req.params.id);
     result.rows[0].updated_by_name = actor.actorName;
     result.rows[0].updated_by_email = actor.actorEmail;
     result.rows[0].updated_at = new Date().toISOString();
 
+    await logPipelineEvent(db, {
+      applicationId: req.params.id,
+      stage: statusToStage(nextStatus),
+      action: previousStatus === nextStatus ? 'updated' : 'moved',
+      fromStatus: previousStatus,
+      toStatus: nextStatus,
+      outcome: nextStatus,
+      notes: notes || hrMessage || null,
+      actorName: actor.actorName,
+      actorEmail: actor.actorEmail,
+    });
+
+    if (isRejectedStatus(nextStatus) && !isRejectedStatus(previousStatus)) {
+      sendRejectionEmailForApplication(db, req.params.id, req.employerId, hrMessage || notes || '');
+    }
+
     const positions = await syncJobPositions(db, application.job_id);
     res.json({ ...result.rows[0], positions });
   } catch (error) {
     console.error('Update application status error:', error);
     res.status(500).json({ error: 'Failed to update application' });
+  }
+});
+
+// Move / skip to any pipeline stage (HR can jump ahead)
+router.post('/:id/move-stage', authMiddleware, checkPermission('applications', 'edit'), async (req, res) => {
+  const db = req.app.locals.db;
+  const { toStatus, notes, skippedStages, rejectionMessage } = req.body;
+
+  try {
+    const target = MOVE_TARGETS.find((t) => t.status === (toStatus || '').toLowerCase());
+    if (!target) {
+      return res.status(400).json({ error: 'Invalid target status', allowed: MOVE_TARGETS.map((t) => t.status) });
+    }
+
+    const checkResult = await db.query(
+      `SELECT a.id, a.job_id, a.status AS current_status,
+              a.skip_test, a.skip_ai_interview, a.skip_final_interview
+       FROM applications a
+       LEFT JOIN jobs j ON a.job_id = j.id
+       WHERE a.id = $1 AND j.employer_id = $2`,
+      [req.params.id, req.employerId]
+    );
+
+    if (checkResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Application not found' });
+    }
+
+    const application = checkResult.rows[0];
+    const previousStatus = application.current_status;
+    const wasHired = (previousStatus || '').toLowerCase() === 'hired';
+    const hrMessage = typeof rejectionMessage === 'string' ? rejectionMessage.trim() : '';
+
+    if (target.status === 'hired' && !wasHired) {
+      const positionState = await syncJobPositions(db, application.job_id);
+      if (positionState?.is_full) {
+        return res.status(400).json({
+          error: 'No open positions left for this job. Increase openings on the Jobs page first.',
+          positions: positionState,
+        });
+      }
+    }
+
+    const skipTest = Boolean(skippedStages?.includes('test') || application.skip_test);
+    const skipAi = Boolean(skippedStages?.includes('ai_interview') || application.skip_ai_interview);
+    const skipFinal = Boolean(skippedStages?.includes('hr_interview') || application.skip_final_interview);
+    const noteForDb = notes || (isRejectedStatus(target.status) ? hrMessage : null) || null;
+
+    const result = await db.query(
+      `UPDATE applications
+       SET status = $1,
+           current_stage = $2,
+           skip_test = $3,
+           skip_ai_interview = $4,
+           skip_final_interview = $5,
+           employer_notes = COALESCE($6, employer_notes),
+           rejection_reason = CASE
+             WHEN $1::text ILIKE 'rejected%' AND $8::text IS NOT NULL AND LENGTH(TRIM($8::text)) > 0
+             THEN TRIM($8::text)
+             ELSE rejection_reason
+           END,
+           hired_at = CASE WHEN $1 = 'hired' THEN COALESCE(hired_at, NOW()) ELSE hired_at END,
+           updated_at = NOW()
+       WHERE id = $7
+       RETURNING *`,
+      [
+        target.status,
+        target.stage,
+        skipTest,
+        skipAi,
+        skipFinal,
+        noteForDb,
+        req.params.id,
+        isRejectedStatus(target.status) ? (hrMessage || notes || null) : null,
+      ]
+    );
+
+    const actor = await applyApplicationUpdater(db, req, req.params.id);
+    result.rows[0].updated_by_name = actor.actorName;
+    result.rows[0].updated_by_email = actor.actorEmail;
+
+    const fromStage = statusToStage(previousStatus);
+    const action = fromStage === target.stage ? 'moved' : (
+      // jumping forward past stages counts as skip+move
+      PIPELINE_STAGES.findIndex((s) => s.id === target.stage) >
+      PIPELINE_STAGES.findIndex((s) => s.id === fromStage)
+        ? 'skipped'
+        : 'moved'
+    );
+
+    await logPipelineEvent(db, {
+      applicationId: req.params.id,
+      stage: target.stage,
+      action: action === 'skipped' ? 'skipped' : 'moved',
+      fromStatus: previousStatus,
+      toStatus: target.status,
+      outcome: target.status,
+      notes: noteForDb || `Moved from ${previousStatus} to ${target.status}`,
+      actorName: actor.actorName,
+      actorEmail: actor.actorEmail,
+      metadata: { skippedStages: skippedStages || [], fromStage, toStage: target.stage },
+    });
+
+    // Also log skipped intermediate stages
+    if (Array.isArray(skippedStages)) {
+      for (const stageId of skippedStages) {
+        await logPipelineEvent(db, {
+          applicationId: req.params.id,
+          stage: stageId,
+          action: 'skipped',
+          fromStatus: previousStatus,
+          toStatus: target.status,
+          notes: notes || `Stage skipped while moving to ${target.status}`,
+          actorName: actor.actorName,
+          actorEmail: actor.actorEmail,
+        });
+      }
+    }
+
+    if (isRejectedStatus(target.status) && !isRejectedStatus(previousStatus)) {
+      sendRejectionEmailForApplication(db, req.params.id, req.employerId, hrMessage || notes || '');
+    }
+
+    const positions = await syncJobPositions(db, application.job_id);
+    res.json({
+      success: true,
+      application: result.rows[0],
+      from_status: previousStatus,
+      to_status: target.status,
+      positions,
+    });
+  } catch (error) {
+    console.error('Move stage error:', error);
+    res.status(500).json({ error: 'Failed to move pipeline stage', message: error.message });
+  }
+});
+
+// Timeline / events for one application
+router.get('/:id/pipeline-events', authMiddleware, checkPermission('applications', 'read'), async (req, res) => {
+  const db = req.app.locals.db;
+  try {
+    await ensurePipelineEventsTable(db);
+    const check = await db.query(
+      `SELECT a.id FROM applications a
+       JOIN jobs j ON j.id = a.job_id
+       WHERE a.id = $1 AND j.employer_id = $2`,
+      [req.params.id, req.employerId]
+    );
+    if (check.rows.length === 0) {
+      return res.status(404).json({ error: 'Application not found' });
+    }
+
+    const events = await db.query(
+      `SELECT * FROM application_pipeline_events
+       WHERE application_id = $1
+       ORDER BY created_at ASC`,
+      [req.params.id]
+    );
+    res.json({ events: events.rows, stages: PIPELINE_STAGES });
+  } catch (error) {
+    console.error('Pipeline events error:', error);
+    res.status(500).json({ error: 'Failed to load pipeline events' });
   }
 });
 
@@ -441,8 +900,9 @@ router.patch('/:id/pipeline-skips', authMiddleware, checkPermission('application
 // Approve/reject at approval gate (authenticated)
 router.post('/:id/approve', authMiddleware, checkPermission('applications', 'edit'), async (req, res) => {
   const db = req.app.locals.db;
-  const { gateName, approved, notes } = req.body;
+  const { gateName, approved, notes, rejectionMessage } = req.body;
   const emailService = require('../services/email-service');
+  const hrMessage = typeof rejectionMessage === 'string' ? rejectionMessage.trim() : (typeof notes === 'string' ? notes.trim() : '');
   
   try {
     // Check if application belongs to employer's job and get full details
@@ -471,17 +931,18 @@ router.post('/:id/approve', authMiddleware, checkPermission('applications', 'edi
     let nextSteps = 'further evaluation';
     
     if (gateName === 'shortlist') {
-      newStatus = approved ? 'shortlisted' : 'rejected_screening';
+      // Approve from details modal → reviewing (call/screening is next)
+      newStatus = approved ? 'reviewing' : 'rejected';
       stageField = 'shortlist_approved_at';
-      nextSteps = 'assessment test';
+      nextSteps = 'phone screening';
     } else if (gateName === 'test_review') {
-      newStatus = approved ? 'ai_interview' : 'rejected_test';
+      newStatus = approved ? 'reviewing' : 'rejected';
       stageField = 'test_approved_at';
-      nextSteps = 'AI interview';
+      nextSteps = 'phone screening';
     } else if (gateName === 'final_interview') {
-      newStatus = approved ? 'final_interview' : 'rejected_ai_interview';
+      newStatus = approved ? 'interviewing' : 'rejected';
       stageField = 'ai_interview_approved_at';
-      nextSteps = 'final interview';
+      nextSteps = 'interview';
     }
     
     // Update application
@@ -537,7 +998,8 @@ router.post('/:id/approve', authMiddleware, checkPermission('applications', 'edi
         candidateName,
         application.job_title,
         application.company_name || 'HireFlow',
-        industry
+        industry,
+        hrMessage
       ).catch(err => {
         console.error('❌ Error sending rejection email:', err);
       });
@@ -639,6 +1101,19 @@ router.post('/:id/mark-hired', authMiddleware, checkPermission('applications', '
     );
     await applyApplicationUpdater(db, req, req.params.id);
 
+    const hireActor = await getActor(db, req.userId, req.employerId);
+    await logPipelineEvent(db, {
+      applicationId: req.params.id,
+      stage: 'hired',
+      action: 'completed',
+      fromStatus: application.status || application.current_status,
+      toStatus: 'hired',
+      outcome: 'hired',
+      notes: 'Marked as hired',
+      actorName: hireActor.actorName,
+      actorEmail: hireActor.actorEmail,
+    });
+
     const positions = await syncJobPositions(db, application.job_id);
     
     console.log('✅ Candidate marked as hired', positions);
@@ -729,17 +1204,32 @@ router.post('/:id/schedule-final-interview', authMiddleware, checkPermission('ap
     
     const application = appResult.rows[0];
     
-    // Update application status to final_interview
+    // Update application status to interviewing and persist schedule
     await db.query(
       `UPDATE applications 
-       SET status = 'final_interview',
-           current_stage = 'final_interview',
+       SET status = 'interviewing',
+           current_stage = 'interviewing',
+           interview_date = $2,
+           interview_time = $3,
            final_interview_scheduled_at = NOW(),
            updated_at = NOW()
        WHERE id = $1`,
-      [req.params.id]
+      [req.params.id, interviewDate || null, interviewTime || null]
     );
     await applyApplicationUpdater(db, req, req.params.id);
+
+    const actor = await getActor(db, req.userId, req.employerId);
+    await logPipelineEvent(db, {
+      applicationId: req.params.id,
+      stage: 'hr_interview',
+      action: 'started',
+      fromStatus: application.status,
+      toStatus: 'interviewing',
+      notes: `Interview scheduled for ${interviewDate} ${interviewTime || ''}`.trim(),
+      actorName: actor.actorName,
+      actorEmail: actor.actorEmail,
+      metadata: { interviewDate, interviewTime, interviewType },
+    });
     
     // Format date and time for email
     const interviewDateTime = new Date(`${interviewDate}T${interviewTime}`);
@@ -994,17 +1484,17 @@ Keep the response professional, concise, and actionable.`;
       [req.params.id, JSON.stringify(parameters), finalScore, aiDecision, recommendation, actor.actorName, actor.actorEmail]
     );
 
-    // Update application status to 'final_interview' after scoring
+    // Final scoring moves candidate into reviewing stage
     await db.query(
       `UPDATE applications
-       SET status = 'final_interview',
+       SET status = 'reviewing',
            updated_at = NOW()
        WHERE id = $1`,
       [req.params.id]
     );
     await applyApplicationUpdater(db, req, req.params.id);
 
-    console.log('✅ Final scoring saved and status updated to final_interview');
+    console.log('✅ Final scoring saved and status updated to reviewing');
 
     res.json({
       success: true,

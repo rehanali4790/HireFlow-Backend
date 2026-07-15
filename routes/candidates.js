@@ -16,6 +16,12 @@ router.get('/', authMiddleware, checkPermission('candidates', 'read'), async (re
        INNER JOIN applications a ON c.id = a.candidate_id
        INNER JOIN jobs j ON a.job_id = j.id
        WHERE j.employer_id = $1
+         AND NOT EXISTS (
+           SELECT 1 FROM candidate_blacklist b
+           WHERE b.employer_id = $1
+             AND b.candidate_id = c.id
+             AND b.removed_at IS NULL
+         )
        GROUP BY c.id
        ORDER BY last_application_date DESC`,
       [req.employerId]
