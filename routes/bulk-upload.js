@@ -4,9 +4,18 @@ const path = require('path');
 const fs = require('fs');
 const { v4: uuidv4 } = require('uuid');
 const authMiddleware = require('../middleware/auth');
-const { checkPermission } = require('../middleware/permissions');
+const { checkPermission, checkAnyPermission, bulkUploadWritePermissions } = require('../middleware/permissions');
+const { resolveEmployerIdForJob } = require('../utils/platform-scope');
 const pdf = require('pdf-parse');
 const router = express.Router();
+
+async function requireJobEmployer(db, req, jobId) {
+  const employerId = await resolveEmployerIdForJob(db, req, jobId);
+  if (!employerId) {
+    return { ok: false, status: 400, error: 'Company context required' };
+  }
+  return { ok: true, employerId };
+}
 
 // Configure multer for file uploads
 const storage = multer.diskStorage({
@@ -32,7 +41,7 @@ const upload = multer({
 });
 
 // Analyze single resume with AI (authenticated)
-router.post('/analyze-resume', authMiddleware, checkPermission('bulk_upload', 'write'), upload.single('resume'), async (req, res) => {
+router.post('/analyze-resume', authMiddleware, checkAnyPermission(bulkUploadWritePermissions), upload.single('resume'), async (req, res) => {
   const db = req.app.locals.db;
   const { jobId } = req.body;
   
@@ -41,10 +50,13 @@ router.post('/analyze-resume', authMiddleware, checkPermission('bulk_upload', 'w
       return res.status(400).json({ error: 'No resume file provided' });
     }
 
+    const scoped = await requireJobEmployer(db, req, jobId);
+    if (!scoped.ok) return res.status(scoped.status).json({ error: scoped.error });
+
     // Get job details
     const jobResult = await db.query(
       `SELECT * FROM jobs WHERE id = $1 AND employer_id = $2`,
-      [jobId, req.employerId]
+      [jobId, scoped.employerId]
     );
 
     if (jobResult.rows.length === 0) {
@@ -155,13 +167,24 @@ If any field is not found, use reasonable defaults:
 });
 
 // Submit application from bulk upload (authenticated)
-router.post('/submit-application', authMiddleware, checkPermission('bulk_upload', 'write'), upload.single('resume'), async (req, res) => {
+router.post('/submit-application', authMiddleware, checkAnyPermission(bulkUploadWritePermissions), upload.single('resume'), async (req, res) => {
   const db = req.app.locals.db;
   const { jobId, firstName, lastName, email, phone, skills, experienceYears } = req.body;
   
   try {
     // Parse skills if it's a string
     const skillsArray = typeof skills === 'string' ? JSON.parse(skills) : skills;
+
+    const scoped = await requireJobEmployer(db, req, jobId);
+    if (!scoped.ok) return res.status(scoped.status).json({ error: scoped.error });
+
+    const jobCheck = await db.query(
+      'SELECT id FROM jobs WHERE id = $1 AND employer_id = $2',
+      [jobId, scoped.employerId]
+    );
+    if (jobCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
 
     // Check if candidate exists
     let candidateId;
@@ -231,15 +254,18 @@ router.post('/submit-application', authMiddleware, checkPermission('bulk_upload'
 });
 
 // Create bulk upload session (authenticated)
-router.post('/session', authMiddleware, checkPermission('bulk_upload', 'write'), async (req, res) => {
+router.post('/session', authMiddleware, checkAnyPermission(bulkUploadWritePermissions), async (req, res) => {
   const db = req.app.locals.db;
   const { jobId, totalCandidates } = req.body;
   
   try {
+    const scoped = await requireJobEmployer(db, req, jobId);
+    if (!scoped.ok) return res.status(scoped.status).json({ error: scoped.error });
+
     // Verify job belongs to employer
     const jobCheck = await db.query(
       'SELECT id FROM jobs WHERE id = $1 AND employer_id = $2',
-      [jobId, req.employerId]
+      [jobId, scoped.employerId]
     );
     
     if (jobCheck.rows.length === 0) {
@@ -251,7 +277,7 @@ router.post('/session', authMiddleware, checkPermission('bulk_upload', 'write'),
         employer_id, job_id, total_candidates, status, created_at, updated_at
       ) VALUES ($1, $2, $3, 'processing', NOW(), NOW())
       RETURNING *`,
-      [req.employerId, jobId, totalCandidates]
+      [scoped.employerId, jobId, totalCandidates]
     );
     
     res.status(201).json(result.rows[0]);
@@ -262,7 +288,7 @@ router.post('/session', authMiddleware, checkPermission('bulk_upload', 'write'),
 });
 
 // Upload candidates in bulk (authenticated)
-router.post('/candidates', authMiddleware, checkPermission('bulk_upload', 'write'), upload.single('file'), async (req, res) => {
+router.post('/candidates', authMiddleware, checkAnyPermission(bulkUploadWritePermissions), upload.single('file'), async (req, res) => {
   const db = req.app.locals.db;
   const { sessionId, candidates } = req.body;
   

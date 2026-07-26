@@ -52,6 +52,19 @@ function inferResponseResourceId(body) {
 }
 
 async function getActor(db, userId, employerId) {
+  if (userId === 'super-admin') {
+    try {
+      const { getSuperAdminCredentials } = require('../utils/super-admin');
+      const creds = getSuperAdminCredentials();
+      return {
+        actorName: 'Super Admin',
+        actorEmail: creds?.email || null,
+      };
+    } catch {
+      return { actorName: 'Super Admin', actorEmail: null };
+    }
+  }
+
   if (!userId || !employerId) {
     return { actorName: 'Unknown', actorEmail: null };
   }
@@ -148,6 +161,11 @@ function auditLogMiddleware(req, res, next) {
   };
 
   res.on('finish', () => {
+    // Never log super admin actions anywhere
+    if (req.userType === 'super_admin' || req.isSuperAdmin) {
+      return;
+    }
+
     if (res.statusCode >= 400 || !req.employerId || res.locals.auditLogged) {
       return;
     }

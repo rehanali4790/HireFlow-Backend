@@ -1,6 +1,7 @@
 const express = require('express');
 const authMiddleware = require('../middleware/auth');
-const { checkPermission } = require('../middleware/permissions');
+const { checkPermission, checkAnyPermission, applicationReadPermissions, applicationEditPermissions, applicationWritePermissions } = require('../middleware/permissions');
+const { isPlatformWide, resolveEmployerIdForApplication } = require('../utils/platform-scope');
 const { getActor } = require('../middleware/audit-log');
 const { syncJobPositions } = require('../utils/job-positions');
 const {
@@ -12,9 +13,22 @@ const {
 } = require('../utils/pipeline-events');
 const router = express.Router();
 
+function isSuperAdminRequest(req) {
+  return Boolean(req.isSuperAdmin || req.userType === 'super_admin');
+}
+
 function isRejectedStatus(status) {
   const s = (status || '').toLowerCase();
   return s === 'rejected' || s.startsWith('rejected_') || s === 'test_cancelled' || s === 'ai_interview_cancelled';
+}
+
+/** Resolve tenant for app actions; SA without X-Tenant-Id uses job's employer. */
+async function requireApplicationEmployer(db, req, applicationId) {
+  const employerId = await resolveEmployerIdForApplication(db, req, applicationId);
+  if (!employerId) {
+    return { ok: false, status: 400, error: 'Company context required' };
+  }
+  return { ok: true, employerId };
 }
 
 /** Fire-and-forget rejection email to candidate (optional HR message in body) */
@@ -65,8 +79,20 @@ async function ensureFinalScoringTable(db) {
   `);
 }
 
-async function applyApplicationUpdater(db, req, applicationId) {
-  const actor = await getActor(db, req.userId, req.employerId);
+/**
+ * Touch application updated_at. Super Admin never writes updated_by_* history.
+ */
+async function applyApplicationUpdater(db, req, applicationId, employerIdOverride = null) {
+  if (isSuperAdminRequest(req)) {
+    await db.query(
+      `UPDATE applications SET updated_at = NOW() WHERE id = $1`,
+      [applicationId]
+    );
+    return { actorName: null, actorEmail: null, skipHistory: true };
+  }
+
+  const employerId = employerIdOverride || req.employerId || await resolveEmployerIdForApplication(db, req, applicationId);
+  const actor = await getActor(db, req.userId, employerId);
   await db.query(
     `UPDATE applications
      SET updated_by_name = $1,
@@ -75,40 +101,101 @@ async function applyApplicationUpdater(db, req, applicationId) {
      WHERE id = $3`,
     [actor.actorName, actor.actorEmail, applicationId]
   );
-  return actor;
+  return { ...actor, skipHistory: false };
+}
+
+function attachUpdaterToRow(row, actor) {
+  if (!actor?.skipHistory) {
+    row.updated_by_name = actor.actorName;
+    row.updated_by_email = actor.actorEmail;
+  }
+  row.updated_at = new Date().toISOString();
+  return row;
+}
+
+function pipelineActorFields(actor) {
+  if (actor?.skipHistory) {
+    return { actorName: null, actorEmail: null };
+  }
+  return { actorName: actor?.actorName || null, actorEmail: actor?.actorEmail || null };
+}
+
+async function resolveActorForRequest(db, req, employerId) {
+  if (isSuperAdminRequest(req)) {
+    return { actorName: null, actorEmail: null, skipHistory: true };
+  }
+  const actor = await getActor(db, req.userId, employerId);
+  return { ...actor, skipHistory: false };
 }
 
 // Get all applications (authenticated - employer's jobs only)
-router.get('/', authMiddleware, checkPermission('applications', 'read'), async (req, res) => {
+// Candidates page is gated by candidates.read but needs application rows.
+router.get('/', authMiddleware, checkAnyPermission([
+  ...applicationReadPermissions,
+]), async (req, res) => {
   const db = req.app.locals.db;
   
   try {
-    const result = await db.query(
-      `SELECT a.*, 
-              c.first_name, c.last_name, c.email, c.phone, c.resume_url, c.picture_url, c.skills, c.certifications,
-              j.title as job_title, j.location as job_location,
-              rs.overall_score, rs.recommendation,
-              ta.passed as test_passed, ta.score as test_score, 
-              ta.max_score as test_max_score, ta.percentage as test_percentage,
-              fs.final_score, fs.recommendation as final_scoring_recommendation,
-              fs.updated_at as final_scoring_updated_at
-       FROM applications a
-       LEFT JOIN candidates c ON a.candidate_id = c.id
-       LEFT JOIN jobs j ON a.job_id = j.id
-       LEFT JOIN resume_scores rs ON a.id = rs.application_id
-       LEFT JOIN test_attempts ta ON a.id = ta.application_id
-       LEFT JOIN final_scoring fs ON a.id = fs.application_id
-       WHERE j.employer_id = $1
-         AND lower(COALESCE(a.status, '')) <> 'blacklisted'
+    const platformWide = isPlatformWide(req);
+    // Overview / reporting can request full history including blacklisted rows.
+    const includeAll = ['1', 'true', 'yes'].includes(String(req.query.include_all || '').toLowerCase());
+
+    const blacklistClause = includeAll
+      ? ''
+      : `AND lower(COALESCE(a.status, '')) <> 'blacklisted'
          AND NOT EXISTS (
            SELECT 1 FROM candidate_blacklist b
-           WHERE b.employer_id = $1
+           WHERE b.employer_id = j.employer_id
              AND b.candidate_id = a.candidate_id
              AND b.removed_at IS NULL
-         )
-       ORDER BY a.application_date DESC`,
-      [req.employerId]
-    );
+         )`;
+
+    const result = platformWide
+      ? await db.query(
+          `SELECT a.*, 
+                  c.first_name, c.last_name, c.email, c.phone, c.resume_url, c.picture_url, c.skills, c.certifications,
+                  j.title as job_title, j.location as job_location, j.employer_id,
+                  rs.overall_score, rs.recommendation,
+                  ta.passed as test_passed, ta.score as test_score, 
+                  ta.max_score as test_max_score, ta.percentage as test_percentage,
+                  fs.final_score, fs.recommendation as final_scoring_recommendation,
+                  fs.updated_at as final_scoring_updated_at
+           FROM applications a
+           LEFT JOIN candidates c ON a.candidate_id = c.id
+           LEFT JOIN jobs j ON a.job_id = j.id
+           LEFT JOIN resume_scores rs ON a.id = rs.application_id
+           LEFT JOIN test_attempts ta ON a.id = ta.application_id
+           LEFT JOIN final_scoring fs ON a.id = fs.application_id
+           WHERE TRUE
+             ${blacklistClause}
+           ORDER BY a.application_date DESC`
+        )
+      : await db.query(
+          `SELECT a.*, 
+                  c.first_name, c.last_name, c.email, c.phone, c.resume_url, c.picture_url, c.skills, c.certifications,
+                  j.title as job_title, j.location as job_location,
+                  rs.overall_score, rs.recommendation,
+                  ta.passed as test_passed, ta.score as test_score, 
+                  ta.max_score as test_max_score, ta.percentage as test_percentage,
+                  fs.final_score, fs.recommendation as final_scoring_recommendation,
+                  fs.updated_at as final_scoring_updated_at
+           FROM applications a
+           LEFT JOIN candidates c ON a.candidate_id = c.id
+           LEFT JOIN jobs j ON a.job_id = j.id
+           LEFT JOIN resume_scores rs ON a.id = rs.application_id
+           LEFT JOIN test_attempts ta ON a.id = ta.application_id
+           LEFT JOIN final_scoring fs ON a.id = fs.application_id
+           WHERE j.employer_id = $1
+             ${includeAll ? '' : `AND lower(COALESCE(a.status, '')) <> 'blacklisted'
+             AND NOT EXISTS (
+               SELECT 1 FROM candidate_blacklist b
+               WHERE b.employer_id = $1
+                 AND b.candidate_id = a.candidate_id
+                 AND b.removed_at IS NULL
+             )`}
+           ORDER BY a.application_date DESC`,
+          [req.employerId]
+        );
     
     res.json(result.rows);
   } catch (error) {
@@ -118,45 +205,90 @@ router.get('/', authMiddleware, checkPermission('applications', 'read'), async (
 });
 
 // Pipeline analytics funnel (must be before /:id)
-router.get('/pipeline-analytics', authMiddleware, checkPermission('applications', 'read'), async (req, res) => {
+router.get('/pipeline-analytics', authMiddleware, checkAnyPermission(applicationReadPermissions), async (req, res) => {
   const db = req.app.locals.db;
   const jobId = req.query.job_id || null;
 
   try {
     await ensurePipelineEventsTable(db);
+    await ensureFinalScoringTable(db);
+    const platformWide = isPlatformWide(req);
+    if (!platformWide && !req.employerId) {
+      return res.status(400).json({ error: 'Company context required' });
+    }
 
-    const appsResult = await db.query(
-      `SELECT a.id, a.status, a.job_id, a.interview_date, a.interview_time,
-              a.final_interview_scheduled_at, a.hired_at, a.skip_test, a.skip_ai_interview, a.skip_final_interview,
-              a.application_date, a.updated_at, a.updated_by_name, a.updated_by_email,
-              c.first_name, c.last_name, c.email, c.phone, c.skills, c.resume_url, c.picture_url,
-              j.title as job_title,
-              rs.overall_score,
-              ta.passed as test_passed, ta.score as test_score, ta.percentage as test_percentage,
-              ai.id as ai_interview_id, ai.overall_score as ai_overall_score, ai.completed_at as ai_completed_at,
-              ai.recommendation as ai_recommendation
-       FROM applications a
-       LEFT JOIN candidates c ON a.candidate_id = c.id
-       LEFT JOIN jobs j ON a.job_id = j.id
-       LEFT JOIN resume_scores rs ON a.id = rs.application_id
-       LEFT JOIN LATERAL (
-         SELECT * FROM test_attempts t WHERE t.application_id = a.id ORDER BY t.created_at DESC NULLS LAST LIMIT 1
-       ) ta ON true
-       LEFT JOIN LATERAL (
-         SELECT * FROM ai_interviews i WHERE i.application_id = a.id ORDER BY i.created_at DESC NULLS LAST LIMIT 1
-       ) ai ON true
-       WHERE j.employer_id = $1
-         AND ($2::uuid IS NULL OR a.job_id = $2::uuid)
-         AND lower(COALESCE(a.status, '')) <> 'blacklisted'
-         AND NOT EXISTS (
-           SELECT 1 FROM candidate_blacklist b
-           WHERE b.employer_id = $1
-             AND b.candidate_id = a.candidate_id
-             AND b.removed_at IS NULL
-         )
-       ORDER BY a.application_date DESC`,
-      [req.employerId, jobId]
-    );
+    const appsResult = platformWide
+      ? await db.query(
+          `SELECT a.id, a.status, a.job_id, a.interview_date, a.interview_time,
+                  a.final_interview_scheduled_at, a.final_interview_rating, a.hired_at,
+                  a.skip_test, a.skip_ai_interview, a.skip_final_interview,
+                  a.application_date, a.updated_at, a.updated_by_name, a.updated_by_email,
+                  c.first_name, c.last_name, c.email, c.phone, c.skills, c.resume_url, c.picture_url,
+                  j.title as job_title,
+                  rs.overall_score,
+                  ta.passed as test_passed, ta.score as test_score, ta.percentage as test_percentage,
+                  ai.id as ai_interview_id, ai.overall_score as ai_overall_score, ai.completed_at as ai_completed_at,
+                  ai.recommendation as ai_recommendation,
+                  fs.final_score, fs.recommendation as final_scoring_recommendation,
+                  fs.updated_at as final_scoring_updated_at
+           FROM applications a
+           LEFT JOIN candidates c ON a.candidate_id = c.id
+           LEFT JOIN jobs j ON a.job_id = j.id
+           LEFT JOIN resume_scores rs ON a.id = rs.application_id
+           LEFT JOIN final_scoring fs ON a.id = fs.application_id
+           LEFT JOIN LATERAL (
+             SELECT * FROM test_attempts t WHERE t.application_id = a.id ORDER BY t.created_at DESC NULLS LAST LIMIT 1
+           ) ta ON true
+           LEFT JOIN LATERAL (
+             SELECT * FROM ai_interviews i WHERE i.application_id = a.id ORDER BY i.created_at DESC NULLS LAST LIMIT 1
+           ) ai ON true
+           WHERE ($1::uuid IS NULL OR a.job_id = $1::uuid)
+             AND lower(COALESCE(a.status, '')) <> 'blacklisted'
+             AND NOT EXISTS (
+               SELECT 1 FROM candidate_blacklist b
+               WHERE b.employer_id = j.employer_id
+                 AND b.candidate_id = a.candidate_id
+                 AND b.removed_at IS NULL
+             )
+           ORDER BY a.application_date DESC`,
+          [jobId]
+        )
+      : await db.query(
+          `SELECT a.id, a.status, a.job_id, a.interview_date, a.interview_time,
+                  a.final_interview_scheduled_at, a.final_interview_rating, a.hired_at,
+                  a.skip_test, a.skip_ai_interview, a.skip_final_interview,
+                  a.application_date, a.updated_at, a.updated_by_name, a.updated_by_email,
+                  c.first_name, c.last_name, c.email, c.phone, c.skills, c.resume_url, c.picture_url,
+                  j.title as job_title,
+                  rs.overall_score,
+                  ta.passed as test_passed, ta.score as test_score, ta.percentage as test_percentage,
+                  ai.id as ai_interview_id, ai.overall_score as ai_overall_score, ai.completed_at as ai_completed_at,
+                  ai.recommendation as ai_recommendation,
+                  fs.final_score, fs.recommendation as final_scoring_recommendation,
+                  fs.updated_at as final_scoring_updated_at
+           FROM applications a
+           LEFT JOIN candidates c ON a.candidate_id = c.id
+           LEFT JOIN jobs j ON a.job_id = j.id
+           LEFT JOIN resume_scores rs ON a.id = rs.application_id
+           LEFT JOIN final_scoring fs ON a.id = fs.application_id
+           LEFT JOIN LATERAL (
+             SELECT * FROM test_attempts t WHERE t.application_id = a.id ORDER BY t.created_at DESC NULLS LAST LIMIT 1
+           ) ta ON true
+           LEFT JOIN LATERAL (
+             SELECT * FROM ai_interviews i WHERE i.application_id = a.id ORDER BY i.created_at DESC NULLS LAST LIMIT 1
+           ) ai ON true
+           WHERE j.employer_id = $1
+             AND ($2::uuid IS NULL OR a.job_id = $2::uuid)
+             AND lower(COALESCE(a.status, '')) <> 'blacklisted'
+             AND NOT EXISTS (
+               SELECT 1 FROM candidate_blacklist b
+               WHERE b.employer_id = $1
+                 AND b.candidate_id = a.candidate_id
+                 AND b.removed_at IS NULL
+             )
+           ORDER BY a.application_date DESC`,
+          [req.employerId, jobId]
+        );
 
     const applications = appsResult.rows;
 
@@ -172,16 +304,26 @@ router.get('/pipeline-analytics', authMiddleware, checkPermission('applications'
     });
 
     // Historical pass-through from events
-    const eventsAgg = await db.query(
-      `SELECT e.stage, e.action, COUNT(*)::int AS count
-       FROM application_pipeline_events e
-       JOIN applications a ON a.id = e.application_id
-       JOIN jobs j ON j.id = a.job_id
-       WHERE j.employer_id = $1
-         AND ($2::uuid IS NULL OR a.job_id = $2::uuid)
-       GROUP BY e.stage, e.action`,
-      [req.employerId, jobId]
-    );
+    const eventsAgg = platformWide
+      ? await db.query(
+          `SELECT e.stage, e.action, COUNT(*)::int AS count
+           FROM application_pipeline_events e
+           JOIN applications a ON a.id = e.application_id
+           JOIN jobs j ON j.id = a.job_id
+           WHERE ($1::uuid IS NULL OR a.job_id = $1::uuid)
+           GROUP BY e.stage, e.action`,
+          [jobId]
+        )
+      : await db.query(
+          `SELECT e.stage, e.action, COUNT(*)::int AS count
+           FROM application_pipeline_events e
+           JOIN applications a ON a.id = e.application_id
+           JOIN jobs j ON j.id = a.job_id
+           WHERE j.employer_id = $1
+             AND ($2::uuid IS NULL OR a.job_id = $2::uuid)
+           GROUP BY e.stage, e.action`,
+          [req.employerId, jobId]
+        );
 
     const historyByStage = {};
     for (const row of eventsAgg.rows) {
@@ -225,63 +367,126 @@ router.get('/pipeline-analytics', authMiddleware, checkPermission('applications'
 });
 
 // Get single application
-router.get('/:id', authMiddleware, checkPermission('applications', 'read'), async (req, res) => {
+router.get('/:id', authMiddleware, checkAnyPermission([
+  { resource: 'applications', action: 'read' },
+  { resource: 'candidates', action: 'read' },
+]), async (req, res) => {
   const db = req.app.locals.db;
   
   try {
-    const result = await db.query(
-      `SELECT 
-        a.id as application_id,
-        a.job_id,
-        a.candidate_id,
-        a.status,
-        a.current_stage,
-        a.application_date,
-        a.interview_date,
-        a.interview_time,
-        a.overall_score as application_overall_score,
-        a.employer_notes,
-        a.rejection_reason,
-        c.id as candidate_id,
-        c.email,
-        c.first_name,
-        c.last_name,
-        c.phone,
-        c.location,
-        c.linkedin_url,
-        c.portfolio_url,
-        c.resume_url,
-        c.picture_url,
-        c.cover_letter,
-        c.skills,
-        c.certifications,
-        c.experience_years,
-        c.education,
-        c.work_history,
-        j.title as job_title,
-        j.description as job_description,
-        j.requirements as job_requirements,
-        j.skills_required as job_skills_required,
-        rs.id as score_id,
-        rs.overall_score,
-        rs.skills_match_score,
-        rs.experience_score,
-        rs.education_score,
-        rs.keywords_matched,
-        rs.keywords_missing,
-        rs.ai_summary,
-        rs.strengths,
-        rs.weaknesses,
-        rs.recommendation,
-        e.company_name
-       FROM applications a
-       LEFT JOIN candidates c ON a.candidate_id = c.id
-       LEFT JOIN jobs j ON a.job_id = j.id
-       LEFT JOIN resume_scores rs ON a.id = rs.application_id
-       LEFT JOIN employers e ON j.employer_id = e.id
-       WHERE a.id = $1 AND j.employer_id = $2`,
-      [req.params.id, req.employerId]
-    );
+    // Super admin without a selected company can read any application (same as list)
+    const platformWide = isPlatformWide(req);
+    if (!platformWide && !req.employerId) {
+      return res.status(400).json({ error: 'Company context required' });
+    }
+
+    const result = platformWide
+      ? await db.query(
+          `SELECT 
+            a.id as application_id,
+            a.job_id,
+            a.candidate_id,
+            a.status,
+            a.current_stage,
+            a.application_date,
+            a.interview_date,
+            a.interview_time,
+            a.overall_score as application_overall_score,
+            a.employer_notes,
+            a.rejection_reason,
+            c.id as candidate_id,
+            c.email,
+            c.first_name,
+            c.last_name,
+            c.phone,
+            c.location,
+            c.linkedin_url,
+            c.portfolio_url,
+            c.resume_url,
+            c.picture_url,
+            c.cover_letter,
+            c.skills,
+            c.certifications,
+            c.experience_years,
+            c.education,
+            c.work_history,
+            j.title as job_title,
+            j.description as job_description,
+            j.requirements as job_requirements,
+            j.skills_required as job_skills_required,
+            rs.id as score_id,
+            rs.overall_score,
+            rs.skills_match_score,
+            rs.experience_score,
+            rs.education_score,
+            rs.keywords_matched,
+            rs.keywords_missing,
+            rs.ai_summary,
+            rs.strengths,
+            rs.weaknesses,
+            rs.recommendation,
+            e.company_name
+           FROM applications a
+           LEFT JOIN candidates c ON a.candidate_id = c.id
+           LEFT JOIN jobs j ON a.job_id = j.id
+           LEFT JOIN resume_scores rs ON a.id = rs.application_id
+           LEFT JOIN employers e ON j.employer_id = e.id
+           WHERE a.id = $1`,
+          [req.params.id]
+        )
+      : await db.query(
+          `SELECT 
+            a.id as application_id,
+            a.job_id,
+            a.candidate_id,
+            a.status,
+            a.current_stage,
+            a.application_date,
+            a.interview_date,
+            a.interview_time,
+            a.overall_score as application_overall_score,
+            a.employer_notes,
+            a.rejection_reason,
+            c.id as candidate_id,
+            c.email,
+            c.first_name,
+            c.last_name,
+            c.phone,
+            c.location,
+            c.linkedin_url,
+            c.portfolio_url,
+            c.resume_url,
+            c.picture_url,
+            c.cover_letter,
+            c.skills,
+            c.certifications,
+            c.experience_years,
+            c.education,
+            c.work_history,
+            j.title as job_title,
+            j.description as job_description,
+            j.requirements as job_requirements,
+            j.skills_required as job_skills_required,
+            rs.id as score_id,
+            rs.overall_score,
+            rs.skills_match_score,
+            rs.experience_score,
+            rs.education_score,
+            rs.keywords_matched,
+            rs.keywords_missing,
+            rs.ai_summary,
+            rs.strengths,
+            rs.weaknesses,
+            rs.recommendation,
+            e.company_name
+           FROM applications a
+           LEFT JOIN candidates c ON a.candidate_id = c.id
+           LEFT JOIN jobs j ON a.job_id = j.id
+           LEFT JOIN resume_scores rs ON a.id = rs.application_id
+           LEFT JOIN employers e ON j.employer_id = e.id
+           WHERE a.id = $1 AND j.employer_id = $2`,
+          [req.params.id, req.employerId]
+        );
     
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Application not found' });
@@ -609,17 +814,21 @@ router.post('/', async (req, res) => {
 });
 
 // Update application status (authenticated)
-router.patch('/:id/status', authMiddleware, checkPermission('applications', 'edit'), async (req, res) => {
+router.patch('/:id/status', authMiddleware, checkAnyPermission(applicationEditPermissions), async (req, res) => {
   const db = req.app.locals.db;
   const { status, notes, rejectionMessage } = req.body;
   
   try {
+    const scoped = await requireApplicationEmployer(db, req, req.params.id);
+    if (!scoped.ok) return res.status(scoped.status).json({ error: scoped.error });
+    const employerId = scoped.employerId;
+
     // Check if application belongs to employer's job
     const checkResult = await db.query(
       `SELECT a.id, a.job_id, a.status AS current_status FROM applications a
        LEFT JOIN jobs j ON a.job_id = j.id
        WHERE a.id = $1 AND j.employer_id = $2`,
-      [req.params.id, req.employerId]
+      [req.params.id, employerId]
     );
     
     if (checkResult.rows.length === 0) {
@@ -641,11 +850,13 @@ router.patch('/:id/status', authMiddleware, checkPermission('applications', 'edi
       }
     }
     
-    // Update application
+    // Update application (keep current_stage in sync so Candidates / Pipeline filters stay correct)
     const previousStatus = application.current_status;
+    const nextStage = statusToStage(nextStatus);
     const result = await db.query(
       `UPDATE applications
        SET status = $1,
+           current_stage = $5,
            employer_notes = COALESCE($2, employer_notes),
            rejection_reason = CASE
              WHEN $1::text ILIKE 'rejected%' AND $4::text IS NOT NULL AND LENGTH(TRIM($4::text)) > 0
@@ -656,12 +867,10 @@ router.patch('/:id/status', authMiddleware, checkPermission('applications', 'edi
            updated_at = NOW()
        WHERE id = $3
        RETURNING *`,
-      [status, notes, req.params.id, isRejectedStatus(nextStatus) ? (hrMessage || notes || null) : null]
+      [status, notes, req.params.id, isRejectedStatus(nextStatus) ? (hrMessage || notes || null) : null, nextStage]
     );
     const actor = await applyApplicationUpdater(db, req, req.params.id);
-    result.rows[0].updated_by_name = actor.actorName;
-    result.rows[0].updated_by_email = actor.actorEmail;
-    result.rows[0].updated_at = new Date().toISOString();
+    attachUpdaterToRow(result.rows[0], actor);
 
     await logPipelineEvent(db, {
       applicationId: req.params.id,
@@ -671,12 +880,11 @@ router.patch('/:id/status', authMiddleware, checkPermission('applications', 'edi
       toStatus: nextStatus,
       outcome: nextStatus,
       notes: notes || hrMessage || null,
-      actorName: actor.actorName,
-      actorEmail: actor.actorEmail,
+      ...pipelineActorFields(actor),
     });
 
     if (isRejectedStatus(nextStatus) && !isRejectedStatus(previousStatus)) {
-      sendRejectionEmailForApplication(db, req.params.id, req.employerId, hrMessage || notes || '');
+      sendRejectionEmailForApplication(db, req.params.id, employerId, hrMessage || notes || '');
     }
 
     const positions = await syncJobPositions(db, application.job_id);
@@ -688,7 +896,7 @@ router.patch('/:id/status', authMiddleware, checkPermission('applications', 'edi
 });
 
 // Move / skip to any pipeline stage (HR can jump ahead)
-router.post('/:id/move-stage', authMiddleware, checkPermission('applications', 'edit'), async (req, res) => {
+router.post('/:id/move-stage', authMiddleware, checkAnyPermission(applicationEditPermissions), async (req, res) => {
   const db = req.app.locals.db;
   const { toStatus, notes, skippedStages, rejectionMessage } = req.body;
 
@@ -698,13 +906,17 @@ router.post('/:id/move-stage', authMiddleware, checkPermission('applications', '
       return res.status(400).json({ error: 'Invalid target status', allowed: MOVE_TARGETS.map((t) => t.status) });
     }
 
+    const scoped = await requireApplicationEmployer(db, req, req.params.id);
+    if (!scoped.ok) return res.status(scoped.status).json({ error: scoped.error });
+    const employerId = scoped.employerId;
+
     const checkResult = await db.query(
       `SELECT a.id, a.job_id, a.status AS current_status,
               a.skip_test, a.skip_ai_interview, a.skip_final_interview
        FROM applications a
        LEFT JOIN jobs j ON a.job_id = j.id
        WHERE a.id = $1 AND j.employer_id = $2`,
-      [req.params.id, req.employerId]
+      [req.params.id, employerId]
     );
 
     if (checkResult.rows.length === 0) {
@@ -761,8 +973,7 @@ router.post('/:id/move-stage', authMiddleware, checkPermission('applications', '
     );
 
     const actor = await applyApplicationUpdater(db, req, req.params.id);
-    result.rows[0].updated_by_name = actor.actorName;
-    result.rows[0].updated_by_email = actor.actorEmail;
+    attachUpdaterToRow(result.rows[0], actor);
 
     const fromStage = statusToStage(previousStatus);
     const action = fromStage === target.stage ? 'moved' : (
@@ -781,8 +992,7 @@ router.post('/:id/move-stage', authMiddleware, checkPermission('applications', '
       toStatus: target.status,
       outcome: target.status,
       notes: noteForDb || `Moved from ${previousStatus} to ${target.status}`,
-      actorName: actor.actorName,
-      actorEmail: actor.actorEmail,
+      ...pipelineActorFields(actor),
       metadata: { skippedStages: skippedStages || [], fromStage, toStage: target.stage },
     });
 
@@ -796,14 +1006,13 @@ router.post('/:id/move-stage', authMiddleware, checkPermission('applications', '
           fromStatus: previousStatus,
           toStatus: target.status,
           notes: notes || `Stage skipped while moving to ${target.status}`,
-          actorName: actor.actorName,
-          actorEmail: actor.actorEmail,
+          ...pipelineActorFields(actor),
         });
       }
     }
 
     if (isRejectedStatus(target.status) && !isRejectedStatus(previousStatus)) {
-      sendRejectionEmailForApplication(db, req.params.id, req.employerId, hrMessage || notes || '');
+      sendRejectionEmailForApplication(db, req.params.id, employerId, hrMessage || notes || '');
     }
 
     const positions = await syncJobPositions(db, application.job_id);
@@ -821,15 +1030,18 @@ router.post('/:id/move-stage', authMiddleware, checkPermission('applications', '
 });
 
 // Timeline / events for one application
-router.get('/:id/pipeline-events', authMiddleware, checkPermission('applications', 'read'), async (req, res) => {
+router.get('/:id/pipeline-events', authMiddleware, checkAnyPermission(applicationReadPermissions), async (req, res) => {
   const db = req.app.locals.db;
   try {
     await ensurePipelineEventsTable(db);
+    const scoped = await requireApplicationEmployer(db, req, req.params.id);
+    if (!scoped.ok) return res.status(scoped.status).json({ error: scoped.error });
+
     const check = await db.query(
       `SELECT a.id FROM applications a
        JOIN jobs j ON j.id = a.job_id
        WHERE a.id = $1 AND j.employer_id = $2`,
-      [req.params.id, req.employerId]
+      [req.params.id, scoped.employerId]
     );
     if (check.rows.length === 0) {
       return res.status(404).json({ error: 'Application not found' });
@@ -849,7 +1061,7 @@ router.get('/:id/pipeline-events', authMiddleware, checkPermission('applications
 });
 
 // Update per-candidate pipeline skip settings (authenticated)
-router.patch('/:id/pipeline-skips', authMiddleware, checkPermission('applications', 'edit'), async (req, res) => {
+router.patch('/:id/pipeline-skips', authMiddleware, checkAnyPermission(applicationEditPermissions), async (req, res) => {
   const db = req.app.locals.db;
   const {
     skip_test = false,
@@ -858,12 +1070,16 @@ router.patch('/:id/pipeline-skips', authMiddleware, checkPermission('application
   } = req.body;
 
   try {
+    const scoped = await requireApplicationEmployer(db, req, req.params.id);
+    if (!scoped.ok) return res.status(scoped.status).json({ error: scoped.error });
+    const employerId = scoped.employerId;
+
     // Check if application belongs to employer's job
     const checkResult = await db.query(
       `SELECT a.id FROM applications a
        LEFT JOIN jobs j ON a.job_id = j.id
        WHERE a.id = $1 AND j.employer_id = $2`,
-      [req.params.id, req.employerId]
+      [req.params.id, employerId]
     );
 
     if (checkResult.rows.length === 0) {
@@ -886,9 +1102,7 @@ router.patch('/:id/pipeline-skips', authMiddleware, checkPermission('application
       ]
     );
     const actor = await applyApplicationUpdater(db, req, req.params.id);
-    result.rows[0].updated_by_name = actor.actorName;
-    result.rows[0].updated_by_email = actor.actorEmail;
-    result.rows[0].updated_at = new Date().toISOString();
+    attachUpdaterToRow(result.rows[0], actor);
 
     res.json(result.rows[0]);
   } catch (error) {
@@ -898,13 +1112,17 @@ router.patch('/:id/pipeline-skips', authMiddleware, checkPermission('application
 });
 
 // Approve/reject at approval gate (authenticated)
-router.post('/:id/approve', authMiddleware, checkPermission('applications', 'edit'), async (req, res) => {
+router.post('/:id/approve', authMiddleware, checkAnyPermission(applicationEditPermissions), async (req, res) => {
   const db = req.app.locals.db;
   const { gateName, approved, notes, rejectionMessage } = req.body;
   const emailService = require('../services/email-service');
   const hrMessage = typeof rejectionMessage === 'string' ? rejectionMessage.trim() : (typeof notes === 'string' ? notes.trim() : '');
   
   try {
+    const scoped = await requireApplicationEmployer(db, req, req.params.id);
+    if (!scoped.ok) return res.status(scoped.status).json({ error: scoped.error });
+    const employerId = scoped.employerId;
+
     // Check if application belongs to employer's job and get full details
     const appResult = await db.query(
       `SELECT a.*, a.status as current_status,
@@ -915,7 +1133,7 @@ router.post('/:id/approve', authMiddleware, checkPermission('applications', 'edi
        LEFT JOIN jobs j ON a.job_id = j.id
        LEFT JOIN employers e ON j.employer_id = e.id
        WHERE a.id = $1 AND j.employer_id = $2`,
-      [req.params.id, req.employerId]
+      [req.params.id, employerId]
     );
     
     if (appResult.rows.length === 0) {
@@ -959,9 +1177,7 @@ router.post('/:id/approve', authMiddleware, checkPermission('applications', 'edi
     
     const result = await db.query(updateQuery, [newStatus, req.params.id]);
     const actor = await applyApplicationUpdater(db, req, req.params.id);
-    result.rows[0].updated_by_name = actor.actorName;
-    result.rows[0].updated_by_email = actor.actorEmail;
-    result.rows[0].updated_at = new Date().toISOString();
+    attachUpdaterToRow(result.rows[0], actor);
     
     // Log approval gate decision
     await db.query(
@@ -969,7 +1185,7 @@ router.post('/:id/approve', authMiddleware, checkPermission('applications', 'edi
         application_id, gate_name, approved, approved_by,
         decision_date, notes, previous_status, new_status, created_at
       ) VALUES ($1, $2, $3, $4, NOW(), $5, $6, $7, NOW())`,
-      [req.params.id, gateName, approved, req.employerId, notes,
+      [req.params.id, gateName, approved, employerId, notes,
        application.current_status, newStatus]
     );
     
@@ -1013,17 +1229,21 @@ router.post('/:id/approve', authMiddleware, checkPermission('applications', 'edi
 });
 
 // Complete final interview (authenticated)
-router.post('/:id/final-interview-complete', authMiddleware, checkPermission('applications', 'edit'), async (req, res) => {
+router.post('/:id/final-interview-complete', authMiddleware, checkAnyPermission(applicationEditPermissions), async (req, res) => {
   const db = req.app.locals.db;
   const { interviewerName, notes, rating, recommendation } = req.body;
   
   try {
+    const scoped = await requireApplicationEmployer(db, req, req.params.id);
+    if (!scoped.ok) return res.status(scoped.status).json({ error: scoped.error });
+    const employerId = scoped.employerId;
+
     // Check if application belongs to employer's job
     const checkResult = await db.query(
       `SELECT a.id FROM applications a
        LEFT JOIN jobs j ON a.job_id = j.id
        WHERE a.id = $1 AND j.employer_id = $2`,
-      [req.params.id, req.employerId]
+      [req.params.id, employerId]
     );
     
     if (checkResult.rows.length === 0) {
@@ -1044,7 +1264,7 @@ router.post('/:id/final-interview-complete', authMiddleware, checkPermission('ap
         req.params.id
       ]
     );
-    await applyApplicationUpdater(db, req, req.params.id);
+    await applyApplicationUpdater(db, req, req.params.id, employerId);
     
     console.log('✅ Final interview marked as completed');
     
@@ -1056,11 +1276,15 @@ router.post('/:id/final-interview-complete', authMiddleware, checkPermission('ap
 });
 
 // Mark as hired (authenticated)
-router.post('/:id/mark-hired', authMiddleware, checkPermission('applications', 'edit'), async (req, res) => {
+router.post('/:id/mark-hired', authMiddleware, checkAnyPermission(applicationEditPermissions), async (req, res) => {
   const db = req.app.locals.db;
   const emailService = require('../services/email-service');
   
   try {
+    const scoped = await requireApplicationEmployer(db, req, req.params.id);
+    if (!scoped.ok) return res.status(scoped.status).json({ error: scoped.error });
+    const employerId = scoped.employerId;
+
     // Get application details
     const appResult = await db.query(
       `SELECT a.*, c.first_name, c.last_name, c.email, j.title as job_title, e.company_name
@@ -1069,7 +1293,7 @@ router.post('/:id/mark-hired', authMiddleware, checkPermission('applications', '
        LEFT JOIN jobs j ON a.job_id = j.id
        LEFT JOIN employers e ON j.employer_id = e.id
        WHERE a.id = $1 AND j.employer_id = $2`,
-      [req.params.id, req.employerId]
+      [req.params.id, employerId]
     );
     
     if (appResult.rows.length === 0) {
@@ -1099,9 +1323,9 @@ router.post('/:id/mark-hired', authMiddleware, checkPermission('applications', '
        WHERE id = $1`,
       [req.params.id]
     );
-    await applyApplicationUpdater(db, req, req.params.id);
+    await applyApplicationUpdater(db, req, req.params.id, employerId);
 
-    const hireActor = await getActor(db, req.userId, req.employerId);
+    const hireActor = await resolveActorForRequest(db, req, employerId);
     await logPipelineEvent(db, {
       applicationId: req.params.id,
       stage: 'hired',
@@ -1110,8 +1334,7 @@ router.post('/:id/mark-hired', authMiddleware, checkPermission('applications', '
       toStatus: 'hired',
       outcome: 'hired',
       notes: 'Marked as hired',
-      actorName: hireActor.actorName,
-      actorEmail: hireActor.actorEmail,
+      ...pipelineActorFields(hireActor),
     });
 
     const positions = await syncJobPositions(db, application.job_id);
@@ -1181,12 +1404,18 @@ router.post('/:id/mark-hired', authMiddleware, checkPermission('applications', '
   }
 });
 
-// Schedule final interview
-router.post('/:id/schedule-final-interview', authMiddleware, checkPermission('applications', 'write'), async (req, res) => {
+// Schedule HOD or HR interview (separate pipeline funnels)
+router.post('/:id/schedule-final-interview', authMiddleware, checkAnyPermission(applicationWritePermissions), async (req, res) => {
   const db = req.app.locals.db;
   const { interviewDate, interviewTime, interviewType, location, interviewers, additionalNotes } = req.body;
+  const pipelineStage = String(req.body.pipelineStage || req.body.interviewStage || 'hr').toLowerCase();
+  const isHodInterview = pipelineStage === 'hod';
   
   try {
+    const scoped = await requireApplicationEmployer(db, req, req.params.id);
+    if (!scoped.ok) return res.status(scoped.status).json({ error: scoped.error });
+    const employerId = scoped.employerId;
+
     // Get application details
     const appResult = await db.query(
       `SELECT a.*, c.first_name, c.last_name, c.email, j.title as job_title, e.company_name
@@ -1195,7 +1424,7 @@ router.post('/:id/schedule-final-interview', authMiddleware, checkPermission('ap
        JOIN jobs j ON a.job_id = j.id
        JOIN employers e ON j.employer_id = e.id
        WHERE a.id = $1 AND j.employer_id = $2`,
-      [req.params.id, req.employerId]
+      [req.params.id, employerId]
     );
     
     if (appResult.rows.length === 0) {
@@ -1203,32 +1432,34 @@ router.post('/:id/schedule-final-interview', authMiddleware, checkPermission('ap
     }
     
     const application = appResult.rows[0];
+    const nextStatus = isHodInterview ? 'hod_interview' : 'interviewing';
+    const nextStage = isHodInterview ? 'hod_interview' : 'hr_interview';
+    const interviewLabel = isHodInterview ? 'HOD Interview' : 'HR / Final Interview';
     
-    // Update application status to interviewing and persist schedule
+    // Keep HOD and HR in separate funnels — do not mix statuses
     await db.query(
       `UPDATE applications 
-       SET status = 'interviewing',
-           current_stage = 'interviewing',
-           interview_date = $2,
-           interview_time = $3,
-           final_interview_scheduled_at = NOW(),
+       SET status = $2,
+           current_stage = $3,
+           interview_date = $4,
+           interview_time = $5,
+           final_interview_scheduled_at = CASE WHEN $6 THEN final_interview_scheduled_at ELSE NOW() END,
            updated_at = NOW()
        WHERE id = $1`,
-      [req.params.id, interviewDate || null, interviewTime || null]
+      [req.params.id, nextStatus, nextStage, interviewDate || null, interviewTime || null, isHodInterview]
     );
-    await applyApplicationUpdater(db, req, req.params.id);
+    await applyApplicationUpdater(db, req, req.params.id, employerId);
 
-    const actor = await getActor(db, req.userId, req.employerId);
+    const actor = await resolveActorForRequest(db, req, employerId);
     await logPipelineEvent(db, {
       applicationId: req.params.id,
-      stage: 'hr_interview',
+      stage: nextStage,
       action: 'started',
       fromStatus: application.status,
-      toStatus: 'interviewing',
-      notes: `Interview scheduled for ${interviewDate} ${interviewTime || ''}`.trim(),
-      actorName: actor.actorName,
-      actorEmail: actor.actorEmail,
-      metadata: { interviewDate, interviewTime, interviewType },
+      toStatus: nextStatus,
+      notes: `${interviewLabel} scheduled for ${interviewDate} ${interviewTime || ''}`.trim(),
+      ...pipelineActorFields(actor),
+      metadata: { interviewDate, interviewTime, interviewType, pipelineStage: isHodInterview ? 'hod' : 'hr' },
     });
     
     // Format date and time for email
@@ -1249,11 +1480,11 @@ router.post('/:id/schedule-final-interview', authMiddleware, checkPermission('ap
     const emailService = require('../services/email-service');
     await emailService.sendEmail(
       application.email,
-      `Final Interview Scheduled - ${application.job_title}`,
+      `${interviewLabel} Scheduled - ${application.job_title}`,
       `
         <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
           <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 30px; text-align: center; border-radius: 10px 10px 0 0;">
-            <h1 style="color: white; margin: 0; font-size: 28px;">📅 Final Interview Scheduled!</h1>
+            <h1 style="color: white; margin: 0; font-size: 28px;">📅 ${interviewLabel} Scheduled!</h1>
           </div>
           
           <div style="background: #f8f9fa; padding: 30px; border-radius: 0 0 10px 10px;">
@@ -1331,7 +1562,9 @@ router.post('/:id/schedule-final-interview', authMiddleware, checkPermission('ap
     
     res.json({ 
       success: true, 
-      message: 'Final interview scheduled successfully',
+      message: `${interviewLabel} scheduled successfully`,
+      status: nextStatus,
+      stage: nextStage,
       interviewDate: formattedDate,
       interviewTime: formattedTime
     });
@@ -1342,7 +1575,7 @@ router.post('/:id/schedule-final-interview', authMiddleware, checkPermission('ap
 });
 
 // Final Scoring Analysis (authenticated)
-router.post('/:id/final-scoring', authMiddleware, checkPermission('applications', 'edit'), async (req, res) => {
+router.post('/:id/final-scoring', authMiddleware, checkAnyPermission(applicationEditPermissions), async (req, res) => {
   const db = req.app.locals.db;
   const { parameters } = req.body;
 
@@ -1352,6 +1585,10 @@ router.post('/:id/final-scoring', authMiddleware, checkPermission('applications'
     }
 
     await ensureFinalScoringTable(db);
+
+    const scoped = await requireApplicationEmployer(db, req, req.params.id);
+    if (!scoped.ok) return res.status(scoped.status).json({ error: scoped.error });
+    const employerId = scoped.employerId;
 
     // Get application details
     const appResult = await db.query(
@@ -1368,7 +1605,7 @@ router.post('/:id/final-scoring', authMiddleware, checkPermission('applications'
        LEFT JOIN resume_scores rs ON a.id = rs.application_id
        LEFT JOIN test_attempts ta ON a.id = ta.application_id
        WHERE a.id = $1 AND j.employer_id = $2`,
-      [req.params.id, req.employerId]
+      [req.params.id, employerId]
     );
 
     if (appResult.rows.length === 0) {
@@ -1463,47 +1700,65 @@ Keep the response professional, concise, and actionable.`;
       recommendation = 'consider';
     }
 
-    const actor = await getActor(db, req.userId, req.employerId);
+    const actor = await resolveActorForRequest(db, req, employerId);
 
-    // Store the final scoring in database
-    await db.query(
-      `INSERT INTO final_scoring (
-         application_id, parameters, final_score, ai_decision, recommendation,
-         updated_by_name, updated_by_email, created_at, updated_at
-       )
-       VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
-       ON CONFLICT (application_id) 
-       DO UPDATE SET
-         parameters = $2,
-         final_score = $3,
-         ai_decision = $4,
-         recommendation = $5,
-         updated_by_name = $6,
-         updated_by_email = $7,
-         updated_at = NOW()`,
-      [req.params.id, JSON.stringify(parameters), finalScore, aiDecision, recommendation, actor.actorName, actor.actorEmail]
-    );
+    // Store the final scoring in database (SA never writes updated_by_*)
+    if (actor.skipHistory) {
+      await db.query(
+        `INSERT INTO final_scoring (
+           application_id, parameters, final_score, ai_decision, recommendation,
+           created_at, updated_at
+         )
+         VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
+         ON CONFLICT (application_id) 
+         DO UPDATE SET
+           parameters = $2,
+           final_score = $3,
+           ai_decision = $4,
+           recommendation = $5,
+           updated_at = NOW()`,
+        [req.params.id, JSON.stringify(parameters), finalScore, aiDecision, recommendation]
+      );
+    } else {
+      await db.query(
+        `INSERT INTO final_scoring (
+           application_id, parameters, final_score, ai_decision, recommendation,
+           updated_by_name, updated_by_email, created_at, updated_at
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
+         ON CONFLICT (application_id) 
+         DO UPDATE SET
+           parameters = $2,
+           final_score = $3,
+           ai_decision = $4,
+           recommendation = $5,
+           updated_by_name = $6,
+           updated_by_email = $7,
+           updated_at = NOW()`,
+        [req.params.id, JSON.stringify(parameters), finalScore, aiDecision, recommendation, actor.actorName, actor.actorEmail]
+      );
+    }
 
-    // Final scoring moves candidate into reviewing stage
-    await db.query(
-      `UPDATE applications
-       SET status = 'reviewing',
-           updated_at = NOW()
-       WHERE id = $1`,
-      [req.params.id]
-    );
+    // Keep pipeline status as-is — final scoring must not yank candidates back to reviewing
     await applyApplicationUpdater(db, req, req.params.id);
 
-    console.log('✅ Final scoring saved and status updated to reviewing');
+    console.log('✅ Final scoring saved');
+
+    const saved = await db.query(
+      `SELECT updated_by_name, updated_by_email, updated_at
+       FROM final_scoring WHERE application_id = $1`,
+      [req.params.id]
+    );
+    const savedRow = saved.rows[0] || {};
 
     res.json({
       success: true,
       finalScore: finalScore,
       decision: aiDecision,
       recommendation: recommendation,
-      updatedByName: actor.actorName,
-      updatedByEmail: actor.actorEmail,
-      updatedAt: new Date().toISOString(),
+      updatedByName: savedRow.updated_by_name || null,
+      updatedByEmail: savedRow.updated_by_email || null,
+      updatedAt: savedRow.updated_at || new Date().toISOString(),
     });
   } catch (error) {
     console.error('Final scoring error:', error);
@@ -1512,7 +1767,7 @@ Keep the response professional, concise, and actionable.`;
 });
 
 // Get Final Scoring Data (authenticated)
-router.get('/:id/final-scoring', authMiddleware, checkPermission('applications', 'read'), async (req, res) => {
+router.get('/:id/final-scoring', authMiddleware, checkAnyPermission(applicationReadPermissions), async (req, res) => {
   const db = req.app.locals.db;
 
   try {

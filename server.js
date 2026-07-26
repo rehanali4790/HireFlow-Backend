@@ -48,6 +48,23 @@ async function ensurePipelineSkipColumns() {
   console.log('✅ Application pipeline skip columns ready');
 }
 
+async function ensureTestAttemptsColumns() {
+  try {
+    await pool.query(`
+      ALTER TABLE test_attempts
+      ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()
+    `);
+    await pool.query(`
+      UPDATE test_attempts
+      SET updated_at = COALESCE(updated_at, created_at, NOW())
+      WHERE updated_at IS NULL
+    `);
+    console.log('✅ Test attempts columns ready');
+  } catch (err) {
+    console.error('⚠️ Failed to ensure test_attempts columns:', err.message);
+  }
+}
+
 async function ensurePermissionCatalog() {
   const resources = getPermissionResources();
 
@@ -285,6 +302,7 @@ async function initializeDatabase() {
       warn: (message) => console.warn(message),
     });
     await ensurePipelineSkipColumns();
+    await ensureTestAttemptsColumns();
     await ensurePermissionCatalog();
     await ensureActivityLog();
     await ensureFinalScoringMetadata();
@@ -299,10 +317,10 @@ initializeDatabase();
 
 // Middleware
 app.use(cors({
-  origin: true, // Allow all origins in development
-  credentials: true,
+  origin: '*', // Allow all origins in development
+  credentials: false,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'x-employer-id', 'x-user-id'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-employer-id', 'x-tenant-id', 'x-user-id', 'ngrok-skip-browser-warning'],
 }));
 app.use(express.json({ limit: '25mb' }));
 app.use(express.urlencoded({ extended: true, limit: '25mb' }));
@@ -329,6 +347,9 @@ app.use('/api/roles', require('./routes/roles'));
 app.use('/api/activity', require('./routes/activity'));
 app.use('/api/prescreening', require('./routes/prescreening').router);
 app.use('/api/jobs', require('./routes/jobs'));
+app.use('/api/external/jobs', require('./routes/external-jobs'));
+app.use('/api/locations', require('./routes/locations'));
+app.use('/api/departments', require('./routes/departments'));
 app.use('/api/applications', require('./routes/applications'));
 app.use('/api/candidates', require('./routes/candidates'));
 app.use('/api/blacklist', require('./routes/blacklist'));

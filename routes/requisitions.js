@@ -1,7 +1,8 @@
 const express = require('express');
 const authMiddleware = require('../middleware/auth');
 const { checkPermission, hasPermissionValue } = require('../middleware/permissions');
-const { getActor } = require('../middleware/audit-log');
+const { getActor, logActivity } = require('../middleware/audit-log');
+const { isPlatformWide } = require('../utils/platform-scope');
 
 const router = express.Router();
 
@@ -9,11 +10,20 @@ const VALID_STATUSES = ['pending', 'accepted', 'rejected', 'on_hold'];
 
 /** Employer/owner accounts use employers.id as userId — not in users table, so FK cols must be null. */
 function resolveUsersFkId(req) {
-  return req.userId && req.userId !== req.employerId ? req.userId : null;
+  if (!req.userId || req.userId === 'super-admin' || req.isSuperAdmin) return null;
+  return req.userId !== req.employerId ? req.userId : null;
 }
 
-async function userCanReview(req) {
+async function userCanDecide(req) {
+  if (req.isSuperAdmin) return true;
   if (req.userId === req.employerId) return true;
+  return hasPermissionValue(req, 'requisitions', 'edit');
+}
+
+async function userCanListAll(req) {
+  if (req.isSuperAdmin) return true;
+  if (req.userId === req.employerId) return true;
+  // HR Review: only users with edit can see all company requisitions
   return hasPermissionValue(req, 'requisitions', 'edit');
 }
 
@@ -47,6 +57,24 @@ async function logRequisitionEvent(db, {
       JSON.stringify(metadata || {}),
     ]
   );
+}
+
+async function logRequisitionSubmittedNotification(req, actor, requisition) {
+  await logActivity(req, {
+    action: 'submitted',
+    resourceType: 'requisition_notifications',
+    resourceId: requisition.id,
+    details: {
+      event_type: 'requisition_submitted',
+      title: 'New Requisition Submitted',
+      message: `${actor.actorName || 'A team member'} submitted a requisition for "${requisition.job_title}".`,
+      severity: 'info',
+      job_title: requisition.job_title,
+      department: requisition.department,
+      submitted_by_name: actor.actorName,
+      submitted_by_email: actor.actorEmail,
+    },
+  });
 }
 
 function mapRequisitionRow(row) {
@@ -90,15 +118,25 @@ router.get(
     const scope = String(req.query.scope || 'mine').toLowerCase();
 
     try {
-      const canReview = await userCanReview(req);
-      const params = [req.employerId];
-      const where = ['r.employer_id = $1'];
+      const canDecide = await userCanDecide(req);
+      const canListAll = await userCanListAll(req);
+      const platformWide = isPlatformWide(req);
+      const params = [];
+      const where = [];
+
+      if (!platformWide) {
+        if (!req.employerId) {
+          return res.status(400).json({ error: 'Company context required' });
+        }
+        params.push(req.employerId);
+        where.push('r.employer_id = $1');
+      }
 
       if (scope === 'review') {
-        if (!canReview) {
-          return res.status(403).json({ error: 'You do not have permission to review requisitions' });
+        if (!canListAll) {
+          return res.status(403).json({ error: 'You do not have permission to view requisitions' });
         }
-      } else {
+      } else if (!platformWide) {
         const submitterFk = resolveUsersFkId(req);
         if (submitterFk) {
           params.push(submitterFk);
@@ -126,7 +164,7 @@ router.get(
         )`);
       }
 
-      const whereClause = where.join(' AND ');
+      const whereClause = where.length > 0 ? where.join(' AND ') : 'TRUE';
 
       const countResult = await db.query(
         `SELECT COUNT(*)::int AS total FROM job_requisitions r WHERE ${whereClause}`,
@@ -152,7 +190,9 @@ router.get(
           total,
           totalPages: Math.max(1, Math.ceil(total / limit)),
         },
-        can_review: canReview,
+        can_review: canDecide,
+        can_decide: canDecide,
+        can_list_all: canListAll,
       });
     } catch (error) {
       console.error('List requisitions error:', error);
@@ -238,6 +278,8 @@ router.post(
         metadata: { job_title: title },
       });
 
+      await logRequisitionSubmittedNotification(req, actor, row);
+
       res.status(201).json({ requisition: mapRequisitionRow(row) });
     } catch (error) {
       console.error('Create requisition error:', error);
@@ -266,10 +308,10 @@ router.get(
       }
 
       const requisition = reqResult.rows[0];
-      const canReview = await userCanReview(req);
+      const canListAll = await userCanListAll(req);
       const isOwner = requisition.submitted_by_user_id === req.userId || req.userId === req.employerId;
 
-      if (!canReview && !isOwner) {
+      if (!canListAll && !isOwner) {
         return res.status(403).json({ error: 'You do not have permission to view these logs' });
       }
 
@@ -317,8 +359,8 @@ router.post(
       return res.status(400).json({ error: 'Message is required for this action' });
     }
 
-    const canReview = await userCanReview(req);
-    if (!canReview) {
+    const canDecide = await userCanDecide(req);
+    if (!canDecide) {
       return res.status(403).json({ error: 'You do not have permission to review requisitions' });
     }
 

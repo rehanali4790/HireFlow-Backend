@@ -1,8 +1,10 @@
 const express = require('express');
 const authMiddleware = require('../middleware/auth');
-const { checkPermission } = require('../middleware/permissions');
+const { checkAnyPermission, applicationReadPermissions } = require('../middleware/permissions');
+const { isPlatformWide } = require('../utils/platform-scope');
 
 const router = express.Router();
+const NOTIFICATION_RESOURCE_TYPES = ['candidate_notifications', 'requisition_notifications'];
 
 // Get tenant notification feed (authenticated)
 router.get('/notifications', authMiddleware, async (req, res) => {
@@ -16,10 +18,10 @@ router.get('/notifications', authMiddleware, async (req, res) => {
               details, created_at
        FROM user_activity_log
        WHERE employer_id = $1
-         AND resource_type = 'candidate_notifications'
+         AND resource_type = ANY($2::text[])
        ORDER BY created_at DESC
-       LIMIT $2`,
-      [req.employerId, safeLimit]
+       LIMIT $3`,
+      [req.employerId, NOTIFICATION_RESOURCE_TYPES, safeLimit]
     );
 
     res.json(result.rows);
@@ -38,9 +40,9 @@ router.delete('/notifications/:id', authMiddleware, async (req, res) => {
       `DELETE FROM user_activity_log
        WHERE id = $1
          AND employer_id = $2
-         AND resource_type = 'candidate_notifications'
+         AND resource_type = ANY($3::text[])
        RETURNING id`,
-      [req.params.id, req.employerId]
+      [req.params.id, req.employerId, NOTIFICATION_RESOURCE_TYPES]
     );
 
     if (result.rows.length === 0) {
@@ -55,7 +57,12 @@ router.delete('/notifications/:id', authMiddleware, async (req, res) => {
 });
 
 // Get tenant activity logs (authenticated)
-router.get('/', authMiddleware, checkPermission('settings', 'read'), async (req, res) => {
+router.get('/', authMiddleware, checkAnyPermission([
+  { resource: 'settings', action: 'read' },
+  { resource: 'users', action: 'read' },
+  { resource: 'overview', action: 'read' },
+  ...applicationReadPermissions,
+]), async (req, res) => {
   const db = req.app.locals.db;
   const {
     resource_type,
@@ -65,8 +72,18 @@ router.get('/', authMiddleware, checkPermission('settings', 'read'), async (req,
   } = req.query;
 
   try {
-    const params = [req.employerId];
-    const where = ['employer_id = $1'];
+    const platformWide = isPlatformWide(req);
+    if (!req.employerId && !platformWide) {
+      return res.status(400).json({ error: 'Company context required' });
+    }
+
+    const params = [];
+    const where = [];
+
+    if (!platformWide) {
+      params.push(req.employerId);
+      where.push(`employer_id = $${params.length}`);
+    }
 
     if (resource_type) {
       params.push(resource_type);
@@ -86,12 +103,14 @@ router.get('/', authMiddleware, checkPermission('settings', 'read'), async (req,
     const safeLimit = Math.min(Math.max(parseInt(limit, 10) || 100, 1), 500);
     params.push(safeLimit);
 
+    const whereClause = where.length > 0 ? `WHERE ${where.join(' AND ')}` : '';
+
     const result = await db.query(
       `SELECT id, user_id, employer_id, actor_name, actor_email, action,
               resource_type, resource_id, details, request_method,
               request_path, status_code, created_at
        FROM user_activity_log
-       WHERE ${where.join(' AND ')}
+       ${whereClause}
        ORDER BY created_at DESC
        LIMIT $${params.length}`,
       params

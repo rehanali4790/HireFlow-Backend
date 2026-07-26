@@ -17,6 +17,12 @@ CREATE TABLE IF NOT EXISTS employers (
   website text,
   password_hash text NOT NULL,
   settings jsonb DEFAULT '{}'::jsonb,
+  external_api_enabled boolean DEFAULT false,
+  external_api_slug text,
+  external_api_username text,
+  external_api_password_hash text,
+  external_api_key_prefix text,
+  external_api_updated_at timestamptz,
   created_at timestamptz DEFAULT now(),
   updated_at timestamptz DEFAULT now()
 );

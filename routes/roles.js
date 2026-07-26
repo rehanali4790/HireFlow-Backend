@@ -2,12 +2,18 @@ const express = require('express');
 const router = express.Router();
 const authMiddleware = require('../middleware/auth');
 const { checkPermission, hasPermissionValue } = require('../middleware/permissions');
+const { resolveRolesEmployerId } = require('../utils/platform-employer');
 
-// Get all roles for employer (authenticated)
+// Get all roles (super admin = platform templates; tenant = company roles)
 router.get('/', authMiddleware, checkPermission('roles', 'read'), async (req, res) => {
   const db = req.app.locals.db;
 
   try {
+    const employerId = await resolveRolesEmployerId(req, db);
+    if (!employerId) {
+      return res.status(400).json({ error: 'Company context required' });
+    }
+
     const result = await db.query(
       `SELECT r.id, r.name, r.description, r.is_system_role, r.created_at, r.updated_at,
               COUNT(u.id) as user_count
@@ -16,7 +22,7 @@ router.get('/', authMiddleware, checkPermission('roles', 'read'), async (req, re
        WHERE r.employer_id = $1
        GROUP BY r.id
        ORDER BY r.is_system_role DESC, r.created_at ASC`,
-      [req.employerId]
+      [employerId]
     );
 
     res.json(result.rows);
@@ -26,12 +32,42 @@ router.get('/', authMiddleware, checkPermission('roles', 'read'), async (req, re
   }
 });
 
+// Get available resources (must be before /:id)
+router.get('/resources/list', authMiddleware, async (req, res) => {
+  const db = req.app.locals.db;
+
+  try {
+    const canReadRoles = await hasPermissionValue(req, 'roles', 'read');
+    const canEditRoles = await hasPermissionValue(req, 'roles', 'edit');
+
+    if (!canReadRoles && !canEditRoles) {
+      return res.status(403).json({ error: 'You do not have permission to view permission resources' });
+    }
+
+    const result = await db.query(
+      `SELECT id, name, description, category, sort_order
+       FROM permission_resources
+       WHERE is_active = true
+       ORDER BY category, sort_order, name`
+    );
+
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Get permission resources error:', error);
+    res.status(500).json({ error: 'Failed to fetch permission resources' });
+  }
+});
+
 // Get single role with permissions (authenticated)
 router.get('/:id', authMiddleware, checkPermission('roles', 'read'), async (req, res) => {
   const db = req.app.locals.db;
 
   try {
-    // Get role
+    const employerId = await resolveRolesEmployerId(req, db);
+    if (!employerId) {
+      return res.status(400).json({ error: 'Company context required' });
+    }
+
     const roleResult = await db.query(
       `SELECT r.id, r.name, r.description, r.is_system_role, r.created_at, r.updated_at,
               COUNT(u.id) as user_count
@@ -39,14 +75,13 @@ router.get('/:id', authMiddleware, checkPermission('roles', 'read'), async (req,
        LEFT JOIN users u ON r.id = u.role_id
        WHERE r.id = $1 AND r.employer_id = $2
        GROUP BY r.id`,
-      [req.params.id, req.employerId]
+      [req.params.id, employerId]
     );
 
     if (roleResult.rows.length === 0) {
       return res.status(404).json({ error: 'Role not found' });
     }
 
-    // Get permissions
     const permissionsResult = await db.query(
       `SELECT id, resource, can_read, can_write, can_edit, can_delete
        FROM permissions
@@ -71,50 +106,63 @@ router.post('/', authMiddleware, checkPermission('roles', 'write'), async (req, 
   const { name, description, permissions } = req.body;
 
   try {
-    // Validate required fields
+    const employerId = await resolveRolesEmployerId(req, db);
+    if (!employerId) {
+      return res.status(400).json({ error: 'Company context required' });
+    }
+
     if (!name) {
       return res.status(400).json({ error: 'Role name is required' });
     }
 
-    // Check if role name already exists
     const existing = await db.query(
       'SELECT id FROM roles WHERE employer_id = $1 AND name = $2',
-      [req.employerId, name]
+      [employerId, name]
     );
 
     if (existing.rows.length > 0) {
       return res.status(409).json({ error: 'Role with this name already exists' });
     }
 
-    // Create role
     const roleResult = await db.query(
       `INSERT INTO roles (employer_id, name, description, is_system_role, created_at, updated_at)
        VALUES ($1, $2, $3, false, NOW(), NOW())
        RETURNING id, name, description, is_system_role, created_at, updated_at`,
-      [req.employerId, name, description]
+      [employerId, name, description]
     );
 
     const role = roleResult.rows[0];
 
-    // Create permissions if provided
     if (permissions && Array.isArray(permissions)) {
+      const byResource = new Map();
       for (const perm of permissions) {
+        const resource = typeof perm?.resource === 'string' ? perm.resource.trim() : '';
+        if (!resource) continue;
+        byResource.set(resource, {
+          resource,
+          can_read: !!perm.can_read,
+          can_write: !!perm.can_write,
+          can_edit: !!perm.can_edit,
+          can_delete: !!perm.can_delete,
+        });
+      }
+
+      for (const perm of byResource.values()) {
         await db.query(
           `INSERT INTO permissions (role_id, resource, can_read, can_write, can_edit, can_delete)
            VALUES ($1, $2, $3, $4, $5, $6)`,
           [
             role.id,
             perm.resource,
-            perm.can_read || false,
-            perm.can_write || false,
-            perm.can_edit || false,
-            perm.can_delete || false
+            perm.can_read,
+            perm.can_write,
+            perm.can_edit,
+            perm.can_delete,
           ]
         );
       }
     }
 
-    // Get role with permissions
     const permissionsResult = await db.query(
       'SELECT id, resource, can_read, can_write, can_edit, can_delete FROM permissions WHERE role_id = $1',
       [role.id]
@@ -135,63 +183,90 @@ router.put('/:id', authMiddleware, checkPermission('roles', 'edit'), async (req,
   const { name, description, permissions } = req.body;
 
   try {
-    // Check if role exists
+    const employerId = await resolveRolesEmployerId(req, db);
+    if (!employerId) {
+      return res.status(400).json({ error: 'Company context required' });
+    }
+
     const roleCheck = await db.query(
       'SELECT id, is_system_role FROM roles WHERE id = $1 AND employer_id = $2',
-      [req.params.id, req.employerId]
+      [req.params.id, employerId]
     );
 
     if (roleCheck.rows.length === 0) {
       return res.status(404).json({ error: 'Role not found' });
     }
 
-    // Update role
-    const roleResult = await db.query(
-      `UPDATE roles
-       SET name = COALESCE($1, name),
-           description = COALESCE($2, description),
-           updated_at = NOW()
-       WHERE id = $3 AND employer_id = $4
-       RETURNING id, name, description, is_system_role, created_at, updated_at`,
-      [name, description, req.params.id, req.employerId]
-    );
+    const client = await db.connect();
+    try {
+      await client.query('BEGIN');
 
-    const role = roleResult.rows[0];
+      const roleResult = await client.query(
+        `UPDATE roles
+         SET name = COALESCE($1, name),
+             description = COALESCE($2, description),
+             updated_at = NOW()
+         WHERE id = $3 AND employer_id = $4
+         RETURNING id, name, description, is_system_role, created_at, updated_at`,
+        [name, description, req.params.id, employerId]
+      );
 
-    // Update permissions if provided
-    if (permissions && Array.isArray(permissions)) {
-      // Delete existing permissions
-      await db.query('DELETE FROM permissions WHERE role_id = $1', [role.id]);
+      const role = roleResult.rows[0];
 
-      // Insert new permissions
-      for (const perm of permissions) {
-        await db.query(
-          `INSERT INTO permissions (role_id, resource, can_read, can_write, can_edit, can_delete)
-           VALUES ($1, $2, $3, $4, $5, $6)`,
-          [
-            role.id,
-            perm.resource,
-            perm.can_read || false,
-            perm.can_write || false,
-            perm.can_edit || false,
-            perm.can_delete || false
-          ]
-        );
+      if (permissions && Array.isArray(permissions)) {
+        // Deduplicate + drop invalid rows (null/empty resource caused 500s)
+        const byResource = new Map();
+        for (const perm of permissions) {
+          const resource = typeof perm?.resource === 'string' ? perm.resource.trim() : '';
+          if (!resource) continue;
+          byResource.set(resource, {
+            resource,
+            can_read: !!perm.can_read,
+            can_write: !!perm.can_write,
+            can_edit: !!perm.can_edit,
+            can_delete: !!perm.can_delete,
+          });
+        }
+
+        await client.query('DELETE FROM permissions WHERE role_id = $1', [role.id]);
+
+        for (const perm of byResource.values()) {
+          await client.query(
+            `INSERT INTO permissions (role_id, resource, can_read, can_write, can_edit, can_delete)
+             VALUES ($1, $2, $3, $4, $5, $6)`,
+            [
+              role.id,
+              perm.resource,
+              perm.can_read,
+              perm.can_write,
+              perm.can_edit,
+              perm.can_delete,
+            ]
+          );
+        }
       }
+
+      const permissionsResult = await client.query(
+        'SELECT id, resource, can_read, can_write, can_edit, can_delete FROM permissions WHERE role_id = $1',
+        [role.id]
+      );
+
+      await client.query('COMMIT');
+
+      role.permissions = permissionsResult.rows;
+      res.json(role);
+    } catch (innerError) {
+      await client.query('ROLLBACK');
+      throw innerError;
+    } finally {
+      client.release();
     }
-
-    // Get role with permissions
-    const permissionsResult = await db.query(
-      'SELECT id, resource, can_read, can_write, can_edit, can_delete FROM permissions WHERE role_id = $1',
-      [role.id]
-    );
-
-    role.permissions = permissionsResult.rows;
-
-    res.json(role);
   } catch (error) {
     console.error('Update role error:', error);
-    res.status(500).json({ error: 'Failed to update role' });
+    res.status(500).json({
+      error: 'Failed to update role',
+      message: error.message || undefined,
+    });
   }
 });
 
@@ -200,33 +275,35 @@ router.delete('/:id', authMiddleware, checkPermission('roles', 'delete'), async 
   const db = req.app.locals.db;
 
   try {
-    // Check if role exists
+    const employerId = await resolveRolesEmployerId(req, db);
+    if (!employerId) {
+      return res.status(400).json({ error: 'Company context required' });
+    }
+
     const roleCheck = await db.query(
       'SELECT id, is_system_role, name FROM roles WHERE id = $1 AND employer_id = $2',
-      [req.params.id, req.employerId]
+      [req.params.id, employerId]
     );
 
     if (roleCheck.rows.length === 0) {
       return res.status(404).json({ error: 'Role not found' });
     }
 
-    // Check if role is assigned to any users
     const usersCheck = await db.query(
       'SELECT COUNT(*) as count FROM users WHERE role_id = $1',
       [req.params.id]
     );
 
-    if (parseInt(usersCheck.rows[0].count) > 0) {
-      return res.status(400).json({ 
+    if (parseInt(usersCheck.rows[0].count, 10) > 0) {
+      return res.status(400).json({
         error: 'Cannot delete role that is assigned to users',
-        user_count: parseInt(usersCheck.rows[0].count)
+        user_count: parseInt(usersCheck.rows[0].count, 10),
       });
     }
 
-    // Delete role (permissions will be deleted via CASCADE)
     await db.query(
       'DELETE FROM roles WHERE id = $1 AND employer_id = $2',
-      [req.params.id, req.employerId]
+      [req.params.id, employerId]
     );
 
     res.json({ success: true, message: 'Role deleted successfully' });
@@ -242,10 +319,14 @@ router.put('/:id/permissions', authMiddleware, checkPermission('roles', 'edit'),
   const { permissions } = req.body;
 
   try {
-    // Check if role exists
+    const employerId = await resolveRolesEmployerId(req, db);
+    if (!employerId) {
+      return res.status(400).json({ error: 'Company context required' });
+    }
+
     const roleCheck = await db.query(
       'SELECT id, is_system_role FROM roles WHERE id = $1 AND employer_id = $2',
-      [req.params.id, req.employerId]
+      [req.params.id, employerId]
     );
 
     if (roleCheck.rows.length === 0) {
@@ -256,10 +337,8 @@ router.put('/:id/permissions', authMiddleware, checkPermission('roles', 'edit'),
       return res.status(400).json({ error: 'Permissions array is required' });
     }
 
-    // Delete existing permissions
     await db.query('DELETE FROM permissions WHERE role_id = $1', [req.params.id]);
 
-    // Insert new permissions
     for (const perm of permissions) {
       await db.query(
         `INSERT INTO permissions (role_id, resource, can_read, can_write, can_edit, can_delete)
@@ -270,12 +349,11 @@ router.put('/:id/permissions', authMiddleware, checkPermission('roles', 'edit'),
           perm.can_read || false,
           perm.can_write || false,
           perm.can_edit || false,
-          perm.can_delete || false
+          perm.can_delete || false,
         ]
       );
     }
 
-    // Get updated permissions
     const result = await db.query(
       'SELECT id, resource, can_read, can_write, can_edit, can_delete FROM permissions WHERE role_id = $1',
       [req.params.id]
@@ -285,32 +363,6 @@ router.put('/:id/permissions', authMiddleware, checkPermission('roles', 'edit'),
   } catch (error) {
     console.error('Update permissions error:', error);
     res.status(500).json({ error: 'Failed to update permissions' });
-  }
-});
-
-// Get available resources
-router.get('/resources/list', authMiddleware, async (req, res) => {
-  const db = req.app.locals.db;
-
-  try {
-    const canReadRoles = await hasPermissionValue(req, 'roles', 'read');
-    const canEditRoles = await hasPermissionValue(req, 'roles', 'edit');
-
-    if (!canReadRoles && !canEditRoles) {
-      return res.status(403).json({ error: 'You do not have permission to view permission resources' });
-    }
-
-    const result = await db.query(
-      `SELECT id, name, description, category, sort_order
-       FROM permission_resources
-       WHERE is_active = true
-       ORDER BY category, sort_order, name`
-    );
-
-    res.json(result.rows);
-  } catch (error) {
-    console.error('Get permission resources error:', error);
-    res.status(500).json({ error: 'Failed to fetch permission resources' });
   }
 });
 

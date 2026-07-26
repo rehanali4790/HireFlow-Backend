@@ -22,6 +22,39 @@ function buildFullPermissions() {
   return permissions;
 }
 
+function isEffectiveAdmin(user) {
+  if (!user || !user.is_active) return false;
+  if (user.is_admin) return true;
+  const role = String(user.role_name || '').trim().toLowerCase();
+  return role === 'admin' || role === 'administrator';
+}
+
+const applicationReadPermissions = [
+  { resource: 'applications', action: 'read' },
+  { resource: 'candidates', action: 'read' },
+  { resource: 'overview', action: 'read' },
+];
+
+/** Mutations used from Candidates UI (FE gates on candidates.edit). */
+const applicationEditPermissions = [
+  { resource: 'applications', action: 'edit' },
+  { resource: 'candidates', action: 'edit' },
+];
+
+/** Schedule / write-style actions from Candidates (FE often uses candidates.edit). */
+const applicationWritePermissions = [
+  { resource: 'applications', action: 'write' },
+  { resource: 'applications', action: 'edit' },
+  { resource: 'candidates', action: 'edit' },
+  { resource: 'candidates', action: 'write' },
+];
+
+/** Bulk upload from Candidates page (FE gates on candidates.write). */
+const bulkUploadWritePermissions = [
+  { resource: 'bulk_upload', action: 'write' },
+  { resource: 'candidates', action: 'write' },
+];
+
 async function hasPermissionValue(req, resource, action) {
   const db = req.app.locals.db;
   const actionColumn = actionColumnMap[action];
@@ -30,14 +63,20 @@ async function hasPermissionValue(req, resource, action) {
     return false;
   }
 
+  // Super admin (ENV-only account) has full access
+  if (req.userType === 'super_admin' || req.isSuperAdmin) {
+    return true;
+  }
+
   // Owner (employer) always has full access within their tenant.
   if (req.userId === req.employerId) {
     return true;
   }
 
   const userResult = await db.query(
-    `SELECT u.role_id, u.is_admin, u.is_active
+    `SELECT u.role_id, u.is_admin, u.is_active, r.name AS role_name
      FROM users u
+     LEFT JOIN roles r ON r.id = u.role_id
      WHERE u.id = $1 AND u.employer_id = $2`,
     [req.userId, req.employerId]
   );
@@ -52,8 +91,8 @@ async function hasPermissionValue(req, resource, action) {
     return false;
   }
 
-  // Admin remains a full-access override for backwards compatibility.
-  if (user.is_admin) {
+  // Admin flag or Admin role name = full access (matches UI "ADMIN" badge).
+  if (isEffectiveAdmin(user)) {
     return true;
   }
 
@@ -94,11 +133,37 @@ function checkPermission(resource, action) {
   };
 }
 
+/** Allow access if the user has ANY of the listed resource/action pairs. */
+function checkAnyPermission(requirements) {
+  return async (req, res, next) => {
+    try {
+      for (const { resource, action } of requirements) {
+        if (await hasPermissionValue(req, resource, action)) {
+          return next();
+        }
+      }
+
+      const labels = requirements.map(({ resource, action }) => `${action} ${resource}`).join(' or ');
+      return res.status(403).json({
+        error: `You don't have permission to ${labels}`,
+        required_permission: requirements.map(({ resource, action }) => `${action}_${resource}`),
+      });
+    } catch (error) {
+      console.error('Permission check error:', error);
+      res.status(500).json({ error: 'Failed to check permissions' });
+    }
+  };
+}
+
 // Helper to check if user is admin
 async function requireAdmin(req, res, next) {
   const db = req.app.locals.db;
 
   try {
+    if (req.userType === 'super_admin' || req.isSuperAdmin) {
+      return next();
+    }
+
     // Owner is always admin
     if (req.userId === req.employerId) {
       return next();
@@ -135,15 +200,27 @@ async function getUserPermissions(req, res) {
   const db = req.app.locals.db;
 
   try {
+    // Super admin has all permissions
+    if (req.userType === 'super_admin' || req.isSuperAdmin) {
+      return res.json({
+        is_owner: true,
+        is_admin: true,
+        is_super_admin: true,
+        is_active: true,
+        permissions: buildFullPermissions(),
+      });
+    }
+
     // Owner has all permissions
     if (req.userId === req.employerId) {
-      return res.json({ is_owner: true, is_admin: true, permissions: buildFullPermissions() });
+      return res.json({ is_owner: true, is_admin: true, is_super_admin: false, permissions: buildFullPermissions() });
     }
 
     // Get user info
     const userResult = await db.query(
-      `SELECT u.role_id, u.is_admin, u.is_active
+      `SELECT u.role_id, u.is_admin, u.is_active, r.name AS role_name
        FROM users u
+       LEFT JOIN roles r ON r.id = u.role_id
        WHERE u.id = $1 AND u.employer_id = $2`,
       [req.userId, req.employerId]
     );
@@ -154,8 +231,8 @@ async function getUserPermissions(req, res) {
 
     const user = userResult.rows[0];
 
-    // Admin has all permissions
-    if (user.is_admin) {
+    // Admin flag or Admin role name = full permissions for UI + API parity
+    if (isEffectiveAdmin(user)) {
       return res.json({ is_owner: false, is_admin: true, is_active: user.is_active, permissions: buildFullPermissions() });
     }
 
@@ -196,7 +273,13 @@ async function getUserPermissions(req, res) {
 
 module.exports = {
   checkPermission,
+  checkAnyPermission,
   requireAdmin,
   getUserPermissions,
-  hasPermissionValue
+  hasPermissionValue,
+  applicationReadPermissions,
+  applicationEditPermissions,
+  applicationWritePermissions,
+  bulkUploadWritePermissions,
+  isEffectiveAdmin,
 };

@@ -1,6 +1,7 @@
 const express = require('express');
 const authMiddleware = require('../middleware/auth');
 const { checkPermission } = require('../middleware/permissions');
+const { isPlatformWide } = require('../utils/platform-scope');
 const router = express.Router();
 
 // Get all candidates (authenticated - only those who applied to employer's jobs)
@@ -8,24 +9,46 @@ router.get('/', authMiddleware, checkPermission('candidates', 'read'), async (re
   const db = req.app.locals.db;
   
   try {
-    const result = await db.query(
-      `SELECT DISTINCT c.*,
-              COUNT(a.id) as application_count,
-              MAX(a.application_date) as last_application_date
-       FROM candidates c
-       INNER JOIN applications a ON c.id = a.candidate_id
-       INNER JOIN jobs j ON a.job_id = j.id
-       WHERE j.employer_id = $1
-         AND NOT EXISTS (
-           SELECT 1 FROM candidate_blacklist b
-           WHERE b.employer_id = $1
-             AND b.candidate_id = c.id
-             AND b.removed_at IS NULL
-         )
-       GROUP BY c.id
-       ORDER BY last_application_date DESC`,
-      [req.employerId]
-    );
+    const platformWide = isPlatformWide(req);
+    if (!platformWide && !req.employerId) {
+      return res.status(400).json({ error: 'Company context required' });
+    }
+
+    const result = platformWide
+      ? await db.query(
+          `SELECT DISTINCT c.*,
+                  COUNT(a.id) as application_count,
+                  MAX(a.application_date) as last_application_date
+           FROM candidates c
+           INNER JOIN applications a ON c.id = a.candidate_id
+           INNER JOIN jobs j ON a.job_id = j.id
+           WHERE NOT EXISTS (
+             SELECT 1 FROM candidate_blacklist b
+             WHERE b.employer_id = j.employer_id
+               AND b.candidate_id = c.id
+               AND b.removed_at IS NULL
+           )
+           GROUP BY c.id
+           ORDER BY last_application_date DESC`
+        )
+      : await db.query(
+          `SELECT DISTINCT c.*,
+                  COUNT(a.id) as application_count,
+                  MAX(a.application_date) as last_application_date
+           FROM candidates c
+           INNER JOIN applications a ON c.id = a.candidate_id
+           INNER JOIN jobs j ON a.job_id = j.id
+           WHERE j.employer_id = $1
+             AND NOT EXISTS (
+               SELECT 1 FROM candidate_blacklist b
+               WHERE b.employer_id = $1
+                 AND b.candidate_id = c.id
+                 AND b.removed_at IS NULL
+             )
+           GROUP BY c.id
+           ORDER BY last_application_date DESC`,
+          [req.employerId]
+        );
     
     res.json(result.rows);
   } catch (error) {
@@ -39,15 +62,28 @@ router.get('/:id', authMiddleware, checkPermission('candidates', 'read'), async 
   const db = req.app.locals.db;
   
   try {
-    // Get candidate with their applications to employer's jobs
-    const candidateResult = await db.query(
-      `SELECT c.* FROM candidates c
-       INNER JOIN applications a ON c.id = a.candidate_id
-       INNER JOIN jobs j ON a.job_id = j.id
-       WHERE c.id = $1 AND j.employer_id = $2
-       LIMIT 1`,
-      [req.params.id, req.employerId]
-    );
+    const platformWide = isPlatformWide(req);
+    if (!platformWide && !req.employerId) {
+      return res.status(400).json({ error: 'Company context required' });
+    }
+
+    const candidateResult = platformWide
+      ? await db.query(
+          `SELECT c.* FROM candidates c
+           INNER JOIN applications a ON c.id = a.candidate_id
+           INNER JOIN jobs j ON a.job_id = j.id
+           WHERE c.id = $1
+           LIMIT 1`,
+          [req.params.id]
+        )
+      : await db.query(
+          `SELECT c.* FROM candidates c
+           INNER JOIN applications a ON c.id = a.candidate_id
+           INNER JOIN jobs j ON a.job_id = j.id
+           WHERE c.id = $1 AND j.employer_id = $2
+           LIMIT 1`,
+          [req.params.id, req.employerId]
+        );
     
     if (candidateResult.rows.length === 0) {
       return res.status(404).json({ error: 'Candidate not found' });
@@ -55,17 +91,27 @@ router.get('/:id', authMiddleware, checkPermission('candidates', 'read'), async 
     
     const candidate = candidateResult.rows[0];
     
-    // Get all applications from this candidate to employer's jobs
-    const applicationsResult = await db.query(
-      `SELECT a.*, j.title as job_title, j.location as job_location,
-              rs.overall_score, rs.recommendation
-       FROM applications a
-       LEFT JOIN jobs j ON a.job_id = j.id
-       LEFT JOIN resume_scores rs ON a.id = rs.application_id
-       WHERE a.candidate_id = $1 AND j.employer_id = $2
-       ORDER BY a.application_date DESC`,
-      [req.params.id, req.employerId]
-    );
+    const applicationsResult = platformWide
+      ? await db.query(
+          `SELECT a.*, j.title as job_title, j.location as job_location,
+                  rs.overall_score, rs.recommendation
+           FROM applications a
+           LEFT JOIN jobs j ON a.job_id = j.id
+           LEFT JOIN resume_scores rs ON a.id = rs.application_id
+           WHERE a.candidate_id = $1
+           ORDER BY a.application_date DESC`,
+          [req.params.id]
+        )
+      : await db.query(
+          `SELECT a.*, j.title as job_title, j.location as job_location,
+                  rs.overall_score, rs.recommendation
+           FROM applications a
+           LEFT JOIN jobs j ON a.job_id = j.id
+           LEFT JOIN resume_scores rs ON a.id = rs.application_id
+           WHERE a.candidate_id = $1 AND j.employer_id = $2
+           ORDER BY a.application_date DESC`,
+          [req.params.id, req.employerId]
+        );
     
     candidate.applications = applicationsResult.rows;
     

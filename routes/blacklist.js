@@ -2,7 +2,8 @@ const express = require('express');
 const authMiddleware = require('../middleware/auth');
 const { checkPermission } = require('../middleware/permissions');
 const { getActor } = require('../middleware/audit-log');
-const { logPipelineEvent } = require('../utils/pipeline-events');
+const { logPipelineEvent, ensurePipelineEventsTable } = require('../utils/pipeline-events');
+const { isPlatformWide, applyEmployerScope, buildWhereClause } = require('../utils/platform-scope');
 
 const router = express.Router();
 
@@ -82,6 +83,41 @@ async function findActiveBlacklist(db, employerId, { candidateId, email, phone }
   return result.rows[0] || null;
 }
 
+/** Resolve tenant employer for blacklist writes (super admin may have no X-Tenant-Id). */
+async function resolveBlacklistEmployerId(db, req, { candidateId, applicationId } = {}) {
+  if (req.employerId) return req.employerId;
+
+  if (!req.isSuperAdmin) return null;
+
+  if (applicationId) {
+    const byApp = await db.query(
+      `SELECT j.employer_id
+       FROM applications a
+       JOIN jobs j ON j.id = a.job_id
+       WHERE a.id = $1
+         AND ($2::uuid IS NULL OR a.candidate_id = $2)
+       LIMIT 1`,
+      [applicationId, candidateId || null]
+    );
+    if (byApp.rows[0]?.employer_id) return byApp.rows[0].employer_id;
+  }
+
+  if (candidateId) {
+    const byCandidate = await db.query(
+      `SELECT j.employer_id
+       FROM applications a
+       JOIN jobs j ON j.id = a.job_id
+       WHERE a.candidate_id = $1
+       ORDER BY a.application_date DESC
+       LIMIT 1`,
+      [candidateId]
+    );
+    if (byCandidate.rows[0]?.employer_id) return byCandidate.rows[0].employer_id;
+  }
+
+  return null;
+}
+
 // Resume archive: all applications for employer (paginated + search + status filter)
 router.get(
   '/archive',
@@ -97,14 +133,19 @@ router.get(
     const includeBlacklisted = String(req.query.include_blacklisted || 'true') === 'true';
 
     try {
-      const params = [req.employerId];
-      const where = ['j.employer_id = $1'];
+      const params = [];
+      const where = [];
+      const scope = applyEmployerScope(req, params, where, { tableAlias: 'j' });
+      if (!scope.ok) {
+        return res.status(scope.status).json({ error: scope.error });
+      }
+      const employerRef = scope.employerRef;
 
       if (!includeBlacklisted) {
         where.push(`lower(COALESCE(a.status, '')) <> 'blacklisted'`);
         where.push(`NOT EXISTS (
           SELECT 1 FROM candidate_blacklist b
-          WHERE b.employer_id = $1
+          WHERE b.employer_id = ${employerRef}
             AND b.candidate_id = c.id
             AND b.removed_at IS NULL
         )`);
@@ -130,7 +171,7 @@ router.get(
           lower(a.status) = 'blacklisted'
           OR EXISTS (
             SELECT 1 FROM candidate_blacklist b
-            WHERE b.employer_id = $1 AND b.candidate_id = c.id AND b.removed_at IS NULL
+            WHERE b.employer_id = ${employerRef} AND b.candidate_id = c.id AND b.removed_at IS NULL
           )
         )`);
       } else if (status !== 'all') {
@@ -150,7 +191,7 @@ router.get(
         )`);
       }
 
-      const whereSql = where.join(' AND ');
+      const whereSql = buildWhereClause(where);
 
       const countResult = await db.query(
         `SELECT COUNT(*)::int AS total
@@ -162,12 +203,16 @@ router.get(
       );
 
       const listParams = [...params, limit, offset];
+      await ensurePipelineEventsTable(db);
+
       const listResult = await db.query(
         `SELECT
            a.id AS application_id,
            a.status,
            a.application_date,
            a.updated_at,
+           a.updated_by_name,
+           a.updated_by_email,
            c.id AS candidate_id,
            c.first_name,
            c.last_name,
@@ -183,7 +228,15 @@ router.get(
            b.id AS blacklist_id,
            b.reason AS blacklist_reason,
            b.blacklisted_at,
-           b.blacklisted_by_name
+           b.blacklisted_by_name,
+           last_event.action AS last_event_action,
+           last_event.from_status AS last_event_from_status,
+           last_event.to_status AS last_event_to_status,
+           last_event.actor_name AS last_event_actor_name,
+           last_event.actor_email AS last_event_actor_email,
+           last_event.notes AS last_event_notes,
+           last_event.created_at AS last_event_at,
+           COALESCE(event_counts.total, 0)::int AS activity_count
          FROM applications a
          JOIN candidates c ON c.id = a.candidate_id
          JOIN jobs j ON j.id = a.job_id
@@ -192,6 +245,18 @@ router.get(
            ON b.candidate_id = c.id
           AND b.employer_id = j.employer_id
           AND b.removed_at IS NULL
+         LEFT JOIN LATERAL (
+           SELECT e.action, e.from_status, e.to_status, e.actor_name, e.actor_email, e.notes, e.created_at
+           FROM application_pipeline_events e
+           WHERE e.application_id = a.id
+           ORDER BY e.created_at DESC
+           LIMIT 1
+         ) last_event ON true
+         LEFT JOIN LATERAL (
+           SELECT COUNT(*)::int AS total
+           FROM application_pipeline_events e2
+           WHERE e2.application_id = a.id
+         ) event_counts ON true
          WHERE ${whereSql}
          ORDER BY a.application_date DESC
          LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
@@ -228,8 +293,12 @@ router.get(
     const q = String(req.query.q || '').trim();
 
     try {
-      const params = [req.employerId];
-      const where = ['b.employer_id = $1', 'b.removed_at IS NULL'];
+      const params = [];
+      const where = ['b.removed_at IS NULL'];
+      const scope = applyEmployerScope(req, params, where, { tableAlias: 'b' });
+      if (!scope.ok) {
+        return res.status(scope.status).json({ error: scope.error });
+      }
 
       if (q) {
         params.push(`%${q.toLowerCase()}%`);
@@ -243,7 +312,7 @@ router.get(
         )`);
       }
 
-      const whereSql = where.join(' AND ');
+      const whereSql = buildWhereClause(where);
 
       const countResult = await db.query(
         `SELECT COUNT(*)::int AS total
@@ -312,6 +381,105 @@ router.get(
   }
 );
 
+// Activity timeline for one archived application (pipeline + blacklist logs)
+router.get(
+  '/archive/:applicationId/activity',
+  authMiddleware,
+  checkPermission('candidates', 'read'),
+  async (req, res) => {
+    const db = req.app.locals.db;
+
+    try {
+      await ensurePipelineEventsTable(db);
+
+      const appResult = await db.query(
+        `SELECT
+           a.id AS application_id,
+           a.status,
+           a.updated_at,
+           a.updated_by_name,
+           a.updated_by_email,
+           c.id AS candidate_id,
+           c.first_name,
+           c.last_name,
+           j.title AS job_title
+         FROM applications a
+         JOIN candidates c ON c.id = a.candidate_id
+         JOIN jobs j ON j.id = a.job_id
+         WHERE a.id = $1${isPlatformWide(req) ? '' : ' AND j.employer_id = $2'}`,
+        isPlatformWide(req)
+          ? [req.params.applicationId]
+          : [req.params.applicationId, req.employerId]
+      );
+
+      if (appResult.rows.length === 0) {
+        return res.status(404).json({ error: 'Application not found' });
+      }
+
+      const application = appResult.rows[0];
+
+      const pipelineResult = await db.query(
+        `SELECT
+           'pipeline' AS type,
+           e.action,
+           e.stage,
+           e.from_status,
+           e.to_status,
+           e.outcome,
+           e.notes,
+           e.actor_name,
+           e.actor_email,
+           e.actor_role,
+           e.created_at
+         FROM application_pipeline_events e
+         WHERE e.application_id = $1
+         ORDER BY e.created_at DESC`,
+        [req.params.applicationId]
+      );
+
+      const blacklistResult = await db.query(
+        `SELECT
+           'blacklist' AS type,
+           be.action,
+           be.reason AS notes,
+           be.actor_name,
+           be.actor_email,
+           be.metadata,
+           be.created_at
+         FROM blacklist_events be
+         WHERE be.employer_id = $1
+           AND be.candidate_id = $2
+           AND (be.application_id = $3 OR be.application_id IS NULL)
+         ORDER BY be.created_at DESC`,
+        [req.employerId, application.candidate_id, req.params.applicationId]
+      );
+
+      const events = [
+        ...pipelineResult.rows.map((row) => ({
+          ...row,
+          from_status: row.from_status || null,
+          to_status: row.to_status || null,
+        })),
+        ...blacklistResult.rows.map((row) => ({
+          ...row,
+          stage: 'blacklist',
+          from_status: null,
+          to_status: row.action === 'blacklisted' ? 'blacklisted' : null,
+          outcome: row.action,
+        })),
+      ].sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+
+      res.json({
+        application,
+        events,
+      });
+    } catch (error) {
+      console.error('Resume archive activity error:', error);
+      res.status(500).json({ error: 'Failed to load activity logs' });
+    }
+  }
+);
+
 // Blacklist event logs for a candidate
 router.get(
   '/events/:candidateId',
@@ -354,6 +522,19 @@ router.post(
     }
 
     try {
+      const employerId = await resolveBlacklistEmployerId(db, req, {
+        candidateId,
+        applicationId: applicationId || null,
+      });
+
+      if (!employerId) {
+        return res.status(400).json({
+          error: req.isSuperAdmin
+            ? 'Company context required to blacklist. Open this candidate from a company job, or select a tenant.'
+            : 'Company context required',
+        });
+      }
+
       const candidateResult = await db.query(
         `SELECT c.*
          FROM candidates c
@@ -361,7 +542,7 @@ router.post(
          JOIN jobs j ON j.id = a.job_id
          WHERE c.id = $1 AND j.employer_id = $2
          LIMIT 1`,
-        [candidateId, req.employerId]
+        [candidateId, employerId]
       );
 
       if (candidateResult.rows.length === 0) {
@@ -369,12 +550,12 @@ router.post(
       }
 
       const candidate = candidateResult.rows[0];
-      const existing = await findActiveBlacklist(db, req.employerId, { candidateId });
+      const existing = await findActiveBlacklist(db, employerId, { candidateId });
       if (existing) {
         return res.status(409).json({ error: 'Candidate is already blacklisted', blacklist: existing });
       }
 
-      const actor = await getActor(db, req.userId, req.employerId);
+      const actor = await getActor(db, req.userId, employerId);
 
       const blacklistResult = await db.query(
         `INSERT INTO candidate_blacklist (
@@ -383,7 +564,7 @@ router.post(
         ) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW(), NOW())
         RETURNING *`,
         [
-          req.employerId,
+          employerId,
           candidateId,
           candidate.email,
           candidate.phone || null,
@@ -411,7 +592,7 @@ router.post(
            AND lower(COALESCE(a.status, '')) <> 'blacklisted'
            AND lower(COALESCE(a.status, '')) = ANY($4::text[])
          RETURNING a.id, a.status_before_blacklist`,
-        [req.employerId, candidateId, comment, ACTIVE_PIPELINE_STATUSES]
+        [employerId, candidateId, comment, ACTIVE_PIPELINE_STATUSES]
       );
 
       for (const app of movedApps.rows) {
@@ -430,7 +611,7 @@ router.post(
       }
 
       await logBlacklistEvent(db, {
-        employerId: req.employerId,
+        employerId,
         candidateId,
         applicationId: applicationId || movedApps.rows[0]?.id || null,
         action: 'blacklisted',
@@ -469,24 +650,39 @@ router.post(
     const nextStage = nextStatus === 'shortlisted' ? 'shortlisted' : nextStatus === 'new' ? 'new' : 'reviewing';
 
     try {
-      const existing = await db.query(
-        `SELECT b.*, c.first_name, c.last_name, c.email AS candidate_email
-         FROM candidate_blacklist b
-         JOIN candidates c ON c.id = b.candidate_id
-         WHERE b.id = $1 AND b.employer_id = $2`,
-        [req.params.blacklistId, req.employerId]
-      );
+      const platformWide = isPlatformWide(req);
+      const existing = platformWide
+        ? await db.query(
+            `SELECT b.*, c.first_name, c.last_name, c.email AS candidate_email
+             FROM candidate_blacklist b
+             JOIN candidates c ON c.id = b.candidate_id
+             WHERE b.id = $1`,
+            [req.params.blacklistId]
+          )
+        : await db.query(
+            `SELECT b.*, c.first_name, c.last_name, c.email AS candidate_email
+             FROM candidate_blacklist b
+             JOIN candidates c ON c.id = b.candidate_id
+             WHERE b.id = $1 AND b.employer_id = $2`,
+            [req.params.blacklistId, req.employerId]
+          );
 
       if (existing.rows.length === 0) {
         return res.status(404).json({ error: 'Blacklist record not found' });
       }
 
       const row = existing.rows[0];
+      const employerId = row.employer_id;
+
+      if (!platformWide && req.employerId && employerId !== req.employerId) {
+        return res.status(404).json({ error: 'Blacklist record not found' });
+      }
+
       if (row.removed_at) {
         return res.status(400).json({ error: 'Candidate is already removed from blacklist' });
       }
 
-      const actor = await getActor(db, req.userId, req.employerId);
+      const actor = await getActor(db, req.userId, employerId);
       const note = removeReason || `Removed from blacklist by ${actor.actorName}`;
 
       await db.query(
@@ -532,7 +728,7 @@ router.post(
            AND a.candidate_id = $2
            AND lower(COALESCE(a.status, '')) = 'blacklisted'
          RETURNING a.id, a.status`,
-        [req.employerId, row.candidate_id, nextStatus, nextStage]
+        [employerId, row.candidate_id, nextStatus, nextStage]
       );
 
       // If no blacklisted apps existed (edge), restore latest open app into reviewing
@@ -557,7 +753,7 @@ router.post(
            AND a.job_id = j.id
            AND j.employer_id = $1
            RETURNING a.id, a.status`,
-          [req.employerId, row.candidate_id, nextStatus, nextStage]
+          [employerId, row.candidate_id, nextStatus, nextStage]
         );
         restored = fallback.rows;
       }
@@ -578,7 +774,7 @@ router.post(
       }
 
       await logBlacklistEvent(db, {
-        employerId: req.employerId,
+        employerId,
         candidateId: row.candidate_id,
         applicationId: restored[0]?.id || null,
         action: 'removed',

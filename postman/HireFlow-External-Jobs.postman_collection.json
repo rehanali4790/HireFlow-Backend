@@ -1,0 +1,100 @@
+{
+  "info": {
+    "_postman_id": "hireflow-external-jobs-2026",
+    "name": "HireFlow External Jobs API",
+    "description": "Basic Auth APIs for company career website integration.\n\n**Setup:** Import the environment file and select \"HireFlow Local\" in Postman.\n\n**Endpoints:**\n1. Get All Jobs — all active jobs + filter_options for dropdowns\n2. Get Filtered Jobs — search by title, location, department",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "basic",
+    "basic": [
+      {
+        "key": "username",
+        "value": "{{api_username}}",
+        "type": "string"
+      },
+      {
+        "key": "password",
+        "value": "{{api_password}}",
+        "type": "string"
+      }
+    ]
+  },
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://localhost:3001"
+    },
+    {
+      "key": "api_username",
+      "value": "hireflow_api"
+    },
+    {
+      "key": "api_password",
+      "value": "Shahzaib123"
+    }
+  ],
+  "item": [
+    {
+      "name": "1. Get All Jobs (Website Load)",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/api/external/jobs",
+          "host": ["{{base_url}}"],
+          "path": ["api", "external", "jobs"]
+        },
+        "description": "Returns **active jobs only** for the company + `filter_options` (locations, departments).\n\nEach job includes `job_status` and `job_status_label` (always active)."
+      },
+      "response": []
+    },
+    {
+      "name": "2. Get Filtered Jobs (Search + Filters)",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/api/external/jobs?q=IT&location=Karachi&department=Software&page=1&limit=10",
+          "host": ["{{base_url}}"],
+          "path": ["api", "external", "jobs"],
+          "query": [
+            {
+              "key": "q",
+              "value": "IT",
+              "description": "Title search (contains, case-insensitive)"
+            },
+            {
+              "key": "location",
+              "value": "Karachi",
+              "description": "Exact location match"
+            },
+            {
+              "key": "department",
+              "value": "Software",
+              "description": "Exact department match"
+            },
+            {
+              "key": "job_type",
+              "value": "",
+              "description": "Optional — maps to work_type (future use)",
+              "disabled": true
+            },
+            {
+              "key": "page",
+              "value": "1",
+              "description": "Optional — page number when using limit"
+            },
+            {
+              "key": "limit",
+              "value": "10",
+              "description": "Optional — 1-100. Omit limit on request #1 for all jobs."
+            }
+          ]
+        },
+        "description": "Returns **filtered jobs** using query params. Same response shape as Get All Jobs.\n\n- `q` — job title contains\n- `location` — filter by location\n- `department` — filter by department\n- `page` + `limit` — optional pagination"
+      },
+      "response": []
+    }
+  ]
+}

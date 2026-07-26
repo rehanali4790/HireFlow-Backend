@@ -2,10 +2,12 @@ const express = require('express');
 const authMiddleware = require('../middleware/auth');
 const { checkPermission } = require('../middleware/permissions');
 const { getActor, logActivity } = require('../middleware/audit-log');
+const { isPlatformWide, resolveEmployerIdForApplication } = require('../utils/platform-scope');
 const router = express.Router();
 
-async function applyApplicationUpdater(db, req, applicationId) {
-  const actor = await getActor(db, req.userId, req.employerId);
+async function applyApplicationUpdater(db, req, applicationId, employerIdOverride = null) {
+  const employerId = employerIdOverride || req.employerId || await resolveEmployerIdForApplication(db, req, applicationId);
+  const actor = await getActor(db, req.userId, employerId);
   await db.query(
     `UPDATE applications
      SET updated_by_name = $1,
@@ -47,14 +49,26 @@ router.get('/', authMiddleware, checkPermission('tests', 'read'), async (req, re
   const db = req.app.locals.db;
   
   try {
-    const result = await db.query(
-      `SELECT t.*, j.title as job_title
-       FROM tests t
-       LEFT JOIN jobs j ON t.job_id = j.id
-       WHERE t.employer_id = $1
-       ORDER BY t.created_at DESC`,
-      [req.employerId]
-    );
+    const platformWide = isPlatformWide(req);
+    if (!platformWide && !req.employerId) {
+      return res.status(400).json({ error: 'Company context required' });
+    }
+
+    const result = platformWide
+      ? await db.query(
+          `SELECT t.*, j.title as job_title
+           FROM tests t
+           LEFT JOIN jobs j ON t.job_id = j.id
+           ORDER BY t.created_at DESC`
+        )
+      : await db.query(
+          `SELECT t.*, j.title as job_title
+           FROM tests t
+           LEFT JOIN jobs j ON t.job_id = j.id
+           WHERE t.employer_id = $1
+           ORDER BY t.created_at DESC`,
+          [req.employerId]
+        );
     
     // Map status to is_active for frontend compatibility
     const tests = result.rows.map(test => ({
@@ -592,6 +606,11 @@ router.post('/send-invitation', authMiddleware, checkPermission('tests', 'write'
   const { applicationId } = req.body;
   
   try {
+    const employerId = await resolveEmployerIdForApplication(db, req, applicationId);
+    if (!employerId) {
+      return res.status(400).json({ error: 'Company context required' });
+    }
+
     // Get application details
     const appResult = await db.query(
       `SELECT a.*, c.first_name, c.last_name, c.email, j.title as job_title, j.id as job_id
@@ -599,7 +618,7 @@ router.post('/send-invitation', authMiddleware, checkPermission('tests', 'write'
        LEFT JOIN candidates c ON a.candidate_id = c.id
        LEFT JOIN jobs j ON a.job_id = j.id
        WHERE a.id = $1 AND j.employer_id = $2`,
-      [applicationId, req.employerId]
+      [applicationId, employerId]
     );
     
     if (appResult.rows.length === 0) {
@@ -607,6 +626,11 @@ router.post('/send-invitation', authMiddleware, checkPermission('tests', 'write'
     }
     
     const application = appResult.rows[0];
+
+    const status = String(application.status || '').toLowerCase();
+    if (status === 'hired' || application.hire_date || application.hired_at) {
+      return res.status(400).json({ error: 'This candidate is already hired. Test cannot be sent.' });
+    }
     
     // Get test for this job
     const testResult = await db.query(
@@ -614,7 +638,7 @@ router.post('/send-invitation', authMiddleware, checkPermission('tests', 'write'
        WHERE job_id = $1 AND employer_id = $2 AND status = 'active'
        ORDER BY created_at DESC
        LIMIT 1`,
-      [application.job_id, req.employerId]
+      [application.job_id, employerId]
     );
     
     if (testResult.rows.length === 0) {
@@ -724,7 +748,7 @@ router.post('/send-invitation', authMiddleware, checkPermission('tests', 'write'
        WHERE id = $1`,
       [applicationId]
     );
-    await applyApplicationUpdater(db, req, applicationId);
+    await applyApplicationUpdater(db, req, applicationId, employerId);
     
     res.json({
       success: true,
@@ -836,17 +860,28 @@ router.post('/extend-link/:applicationId', authMiddleware, checkPermission('test
   const { reason, extensionHours } = req.body;
   
   try {
+    const employerId = await resolveEmployerIdForApplication(db, req, applicationId);
+    if (!employerId) {
+      return res.status(400).json({ error: 'Company context required' });
+    }
+
     // Verify application belongs to employer
     const appCheck = await db.query(
       `SELECT a.*, j.employer_id 
        FROM applications a
        LEFT JOIN jobs j ON a.job_id = j.id
        WHERE a.id = $1 AND j.employer_id = $2`,
-      [applicationId, req.employerId]
+      [applicationId, employerId]
     );
     
     if (appCheck.rows.length === 0) {
       return res.status(404).json({ error: 'Application not found' });
+    }
+
+    const application = appCheck.rows[0];
+    const status = String(application.status || '').toLowerCase();
+    if (status === 'hired' || application.hire_date || application.hired_at) {
+      return res.status(400).json({ error: 'This candidate is already hired. Test link cannot be extended.' });
     }
     
     // Get test attempt

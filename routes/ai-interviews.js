@@ -2,11 +2,13 @@ const express = require('express');
 const authMiddleware = require('../middleware/auth');
 const { checkPermission } = require('../middleware/permissions');
 const { getActor, logActivity } = require('../middleware/audit-log');
+const { isPlatformWide, resolveEmployerIdForApplication } = require('../utils/platform-scope');
 const router = express.Router();
 const { v4: uuidv4 } = require('uuid');
 
-async function applyApplicationUpdater(db, req, applicationId) {
-  const actor = await getActor(db, req.userId, req.employerId);
+async function applyApplicationUpdater(db, req, applicationId, employerIdOverride = null) {
+  const employerId = employerIdOverride || req.employerId || await resolveEmployerIdForApplication(db, req, applicationId);
+  const actor = await getActor(db, req.userId, employerId);
   await db.query(
     `UPDATE applications
      SET updated_by_name = $1,
@@ -76,6 +78,11 @@ router.get('/application/:applicationId', authMiddleware, checkPermission('ai_in
   const db = req.app.locals.db;
   
   try {
+    const employerId = await resolveEmployerIdForApplication(db, req, req.params.applicationId);
+    if (!employerId) {
+      return res.status(400).json({ error: 'Company context required' });
+    }
+
     const result = await db.query(
       `SELECT ai.*, 
               a.id as application_id,
@@ -86,7 +93,7 @@ router.get('/application/:applicationId', authMiddleware, checkPermission('ai_in
        LEFT JOIN candidates c ON a.candidate_id = c.id
        LEFT JOIN jobs j ON a.job_id = j.id
        WHERE ai.application_id = $1 AND j.employer_id = $2`,
-      [req.params.applicationId, req.employerId]
+      [req.params.applicationId, employerId]
     );
     
     if (result.rows.length === 0) {
@@ -531,7 +538,12 @@ router.post('/send-invitation', authMiddleware, checkPermission('ai_interviews',
     console.log('📅 Valid from:', validFrom, 'Valid until:', validUntil);
     console.log('🎯 Question count:', questionCount || 'default (5-8)');
     
-    // Get application details
+    // Get application details (resolve company for super-admin platform-wide)
+    const employerId = await resolveEmployerIdForApplication(db, req, applicationId);
+    if (!employerId) {
+      return res.status(400).json({ error: 'Company context required' });
+    }
+
     const appResult = await db.query(
       `SELECT a.*, c.first_name, c.last_name, c.email, j.title as job_title, j.id as job_id, e.company_name
        FROM applications a
@@ -539,7 +551,7 @@ router.post('/send-invitation', authMiddleware, checkPermission('ai_interviews',
        LEFT JOIN jobs j ON a.job_id = j.id
        LEFT JOIN employers e ON j.employer_id = e.id
        WHERE a.id = $1 AND j.employer_id = $2`,
-      [applicationId, req.employerId]
+      [applicationId, employerId]
     );
     
     if (appResult.rows.length === 0) {
@@ -715,7 +727,7 @@ router.post('/send-invitation', authMiddleware, checkPermission('ai_interviews',
        WHERE id = $1`,
       [applicationId]
     );
-    await applyApplicationUpdater(db, req, applicationId);
+    await applyApplicationUpdater(db, req, applicationId, employerId);
     console.log('✅ Application status updated to "ai_interview"');
     
     res.json({
@@ -734,20 +746,38 @@ router.get('/', authMiddleware, checkPermission('ai_interviews', 'read'), async 
   const db = req.app.locals.db;
   
   try {
-    const result = await db.query(
-      `SELECT ai.*, 
-              a.id as application_id, a.status as application_status,
-              a.ai_interview_approved_at,
-              c.first_name, c.last_name, c.email,
-              j.title as job_title, j.id as job_id
-       FROM ai_interviews ai
-       LEFT JOIN applications a ON ai.application_id = a.id
-       LEFT JOIN candidates c ON a.candidate_id = c.id
-       LEFT JOIN jobs j ON a.job_id = j.id
-       WHERE j.employer_id = $1
-       ORDER BY ai.created_at DESC`,
-      [req.employerId]
-    );
+    const platformWide = isPlatformWide(req);
+    if (!platformWide && !req.employerId) {
+      return res.status(400).json({ error: 'Company context required' });
+    }
+
+    const result = platformWide
+      ? await db.query(
+          `SELECT ai.*, 
+                  a.id as application_id, a.status as application_status,
+                  a.ai_interview_approved_at,
+                  c.first_name, c.last_name, c.email,
+                  j.title as job_title, j.id as job_id
+           FROM ai_interviews ai
+           LEFT JOIN applications a ON ai.application_id = a.id
+           LEFT JOIN candidates c ON a.candidate_id = c.id
+           LEFT JOIN jobs j ON a.job_id = j.id
+           ORDER BY ai.created_at DESC`
+        )
+      : await db.query(
+          `SELECT ai.*, 
+                  a.id as application_id, a.status as application_status,
+                  a.ai_interview_approved_at,
+                  c.first_name, c.last_name, c.email,
+                  j.title as job_title, j.id as job_id
+           FROM ai_interviews ai
+           LEFT JOIN applications a ON ai.application_id = a.id
+           LEFT JOIN candidates c ON a.candidate_id = c.id
+           LEFT JOIN jobs j ON a.job_id = j.id
+           WHERE j.employer_id = $1
+           ORDER BY ai.created_at DESC`,
+          [req.employerId]
+        );
     
     // Format interviews to match expected structure
     const interviews = result.rows.map(row => ({
@@ -787,7 +817,12 @@ router.post('/:applicationId/approve', authMiddleware, checkPermission('ai_inter
   try {
     console.log('🎯 AI Interview approval request:', { applicationId, approved, notes });
     
-    // Get application details
+    // Get application details (resolve company for super-admin platform-wide)
+    const employerId = await resolveEmployerIdForApplication(db, req, applicationId);
+    if (!employerId) {
+      return res.status(400).json({ error: 'Company context required' });
+    }
+
     const appResult = await db.query(
       `SELECT a.*, c.first_name, c.last_name, c.email, j.title as job_title, e.company_name, e.industry
        FROM applications a
@@ -795,7 +830,7 @@ router.post('/:applicationId/approve', authMiddleware, checkPermission('ai_inter
        LEFT JOIN jobs j ON a.job_id = j.id
        LEFT JOIN employers e ON j.employer_id = e.id
        WHERE a.id = $1 AND j.employer_id = $2`,
-      [applicationId, req.employerId]
+      [applicationId, employerId]
     );
     
     if (appResult.rows.length === 0) {

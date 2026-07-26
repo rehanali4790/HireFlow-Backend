@@ -3,16 +3,21 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const router = express.Router();
+const authMiddleware = require('../middleware/auth');
 
 // Create uploads directory if it doesn't exist
 const uploadsDir = path.join(__dirname, '../uploads/pictures');
 const resumesDir = path.join(__dirname, '../uploads/resumes');
+const logosDir = path.join(__dirname, '../uploads/logos');
 
 if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
 }
 if (!fs.existsSync(resumesDir)) {
   fs.mkdirSync(resumesDir, { recursive: true });
+}
+if (!fs.existsSync(logosDir)) {
+  fs.mkdirSync(logosDir, { recursive: true });
 }
 
 // Configure multer storage for pictures
@@ -34,6 +39,17 @@ const resumeStorage = multer.diskStorage({
   filename: (req, file, cb) => {
     const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
     cb(null, 'resume-' + uniqueSuffix + path.extname(file.originalname));
+  }
+});
+
+// Configure multer storage for company logos
+const logoStorage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    cb(null, logosDir);
+  },
+  filename: (req, file, cb) => {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    cb(null, 'logo-' + uniqueSuffix + path.extname(file.originalname));
   }
 });
 
@@ -81,6 +97,15 @@ const resumeUpload = multer({
   fileFilter: pdfFilter
 });
 
+// Configure multer for company logos
+const logoUpload = multer({
+  storage: logoStorage,
+  limits: {
+    fileSize: 5 * 1024 * 1024, // 5MB max
+  },
+  fileFilter: imageFilter
+});
+
 // Upload candidate picture
 router.post('/picture', upload.single('picture'), (req, res) => {
   console.log('📸 Picture upload request received:', {
@@ -112,6 +137,26 @@ router.post('/picture', upload.single('picture'), (req, res) => {
   } catch (error) {
     console.error('❌ Upload error:', error);
     res.status(500).json({ error: 'Failed to upload file' });
+  }
+});
+
+// Upload company logo (authenticated — Super Admin / company admin)
+router.post('/logo', authMiddleware, logoUpload.single('logo'), (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No logo file uploaded' });
+    }
+
+    const fileUrl = `/uploads/logos/${req.file.filename}`;
+    res.json({
+      success: true,
+      url: fileUrl,
+      filename: req.file.filename,
+      size: req.file.size,
+    });
+  } catch (error) {
+    console.error('Logo upload error:', error);
+    res.status(500).json({ error: 'Failed to upload logo' });
   }
 });
 

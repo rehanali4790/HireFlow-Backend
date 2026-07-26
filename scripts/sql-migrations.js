@@ -22,6 +22,9 @@ const SQL_MIGRATIONS = [
   { file: 'add-candidate-blacklist.sql', label: 'Candidate blacklist tables' },
   { file: 'add-referred-by.sql', label: 'Application referred_by column' },
   { file: 'add-requisitions.sql', label: 'Job requisitions tables' },
+  { file: 'add-job-locations.sql', label: 'Job locations catalog' },
+  { file: 'add-job-departments.sql', label: 'Job departments catalog' },
+  { file: 'add-employer-external-api.sql', label: 'Employer external API credentials' },
 ];
 
 async function runSqlMigrations(pool, options = {}) {

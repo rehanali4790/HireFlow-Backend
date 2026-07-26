@@ -1,6 +1,7 @@
 const express = require('express');
 const authMiddleware = require('../middleware/auth');
 const { getActor } = require('../middleware/audit-log');
+const { isPlatformWide, resolveEmployerIdForApplication } = require('../utils/platform-scope');
 
 const router = express.Router();
 
@@ -25,14 +26,97 @@ function orderedParticipants(userId, otherUserId) {
   return [userId, otherUserId].sort();
 }
 
-async function getUserChatThreadAccess(db, threadId, req) {
+/** Super-admin is not a UUID user — act as the company owner in chat threads. */
+function resolveChatActorId(req, employerId) {
+  if (req.isSuperAdmin || req.userId === 'super-admin') {
+    return employerId;
+  }
+  return req.userId;
+}
+
+/**
+ * Resolve company for chat actions when SA has no X-Tenant-Id.
+ * Prefers recipient user's company, then thread, then application.
+ */
+async function resolveChatContext(db, req, { recipientUserId, threadId, applicationId, applicationIds } = {}) {
+  let employerId = req.employerId || null;
+
+  if (!employerId && req.isSuperAdmin) {
+    if (recipientUserId) {
+      const byUser = await db.query(
+        `SELECT employer_id FROM users WHERE id = $1 AND is_active = true LIMIT 1`,
+        [recipientUserId]
+      );
+      employerId = byUser.rows[0]?.employer_id || null;
+      if (!employerId) {
+        const byOwner = await db.query(`SELECT id FROM employers WHERE id = $1 LIMIT 1`, [recipientUserId]);
+        employerId = byOwner.rows[0]?.id || null;
+      }
+    }
+
+    if (!employerId && threadId) {
+      const byThread = await db.query(
+        `SELECT employer_id FROM user_chat_threads WHERE id = $1 LIMIT 1`,
+        [threadId]
+      );
+      employerId = byThread.rows[0]?.employer_id || null;
+      if (!employerId) {
+        const byCandThread = await db.query(
+          `SELECT employer_id FROM candidate_chat_threads WHERE id = $1 LIMIT 1`,
+          [threadId]
+        );
+        employerId = byCandThread.rows[0]?.employer_id || null;
+      }
+    }
+
+    if (!employerId && applicationId) {
+      employerId = await resolveEmployerIdForApplication(db, req, applicationId);
+    }
+
+    if (!employerId && Array.isArray(applicationIds) && applicationIds[0]) {
+      employerId = await resolveEmployerIdForApplication(db, req, applicationIds[0]);
+    }
+  }
+
+  if (!employerId) {
+    return { ok: false, status: 400, error: 'Company context required' };
+  }
+
+  return {
+    ok: true,
+    employerId,
+    actorId: resolveChatActorId(req, employerId),
+  };
+}
+
+async function getUserChatThreadAccess(db, threadId, req, employerIdOverride = null) {
+  const employerId = employerIdOverride || req.employerId;
+  const actorId = resolveChatActorId(req, employerId);
+
+  if (!employerId) {
+    // Platform-wide SA fallback: load thread directly if they act as that company owner
+    if (req.isSuperAdmin || req.userId === 'super-admin') {
+      const result = await db.query(`SELECT * FROM user_chat_threads WHERE id = $1`, [threadId]);
+      const thread = result.rows[0];
+      if (!thread) return null;
+      if (
+        thread.participant_one_id === thread.employer_id ||
+        thread.participant_two_id === thread.employer_id
+      ) {
+        return thread;
+      }
+      return thread;
+    }
+    return null;
+  }
+
   const result = await db.query(
     `SELECT *
      FROM user_chat_threads
      WHERE id = $1
        AND employer_id = $2
        AND ($3 = participant_one_id OR $3 = participant_two_id OR $3 = $2)`,
-    [threadId, req.employerId, req.userId]
+    [threadId, employerId, actorId]
   );
   return result.rows[0] || null;
 }
@@ -71,28 +155,53 @@ router.get('/', authMiddleware, async (req, res) => {
   const db = req.app.locals.db;
 
   try {
-    const result = await db.query(
-      `SELECT t.*,
-              c.first_name, c.last_name, c.email as candidate_email, c.phone, c.resume_url,
-              j.title as job_title,
-              u.first_name as assigned_first_name, u.last_name as assigned_last_name, u.email as assigned_email,
-              m.message as last_message
-       FROM candidate_chat_threads t
-       LEFT JOIN applications a ON t.application_id = a.id
-       LEFT JOIN candidates c ON a.candidate_id = c.id
-       LEFT JOIN jobs j ON a.job_id = j.id
-       LEFT JOIN users u ON t.assigned_user_id = u.id
-       LEFT JOIN LATERAL (
-         SELECT message FROM candidate_chat_messages
-         WHERE thread_id = t.id
-         ORDER BY created_at DESC
-         LIMIT 1
-       ) m ON true
-       WHERE t.employer_id = $1
-         AND ($2 = $1 OR t.assigned_user_id = $2 OR t.created_by_user_id = $2)
-       ORDER BY t.last_message_at DESC`,
-      [req.employerId, req.userId]
-    );
+    const platformWide = isPlatformWide(req);
+    if (!platformWide && !req.employerId) {
+      return res.status(400).json({ error: 'Company context required' });
+    }
+
+    const result = platformWide
+      ? await db.query(
+          `SELECT t.*,
+                  c.first_name, c.last_name, c.email as candidate_email, c.phone, c.resume_url,
+                  j.title as job_title,
+                  u.first_name as assigned_first_name, u.last_name as assigned_last_name, u.email as assigned_email,
+                  m.message as last_message
+           FROM candidate_chat_threads t
+           LEFT JOIN applications a ON t.application_id = a.id
+           LEFT JOIN candidates c ON a.candidate_id = c.id
+           LEFT JOIN jobs j ON a.job_id = j.id
+           LEFT JOIN users u ON t.assigned_user_id = u.id
+           LEFT JOIN LATERAL (
+             SELECT message FROM candidate_chat_messages
+             WHERE thread_id = t.id
+             ORDER BY created_at DESC
+             LIMIT 1
+           ) m ON true
+           ORDER BY t.last_message_at DESC`
+        )
+      : await db.query(
+          `SELECT t.*,
+                  c.first_name, c.last_name, c.email as candidate_email, c.phone, c.resume_url,
+                  j.title as job_title,
+                  u.first_name as assigned_first_name, u.last_name as assigned_last_name, u.email as assigned_email,
+                  m.message as last_message
+           FROM candidate_chat_threads t
+           LEFT JOIN applications a ON t.application_id = a.id
+           LEFT JOIN candidates c ON a.candidate_id = c.id
+           LEFT JOIN jobs j ON a.job_id = j.id
+           LEFT JOIN users u ON t.assigned_user_id = u.id
+           LEFT JOIN LATERAL (
+             SELECT message FROM candidate_chat_messages
+             WHERE thread_id = t.id
+             ORDER BY created_at DESC
+             LIMIT 1
+           ) m ON true
+           WHERE t.employer_id = $1
+             AND ($2 = $1 OR t.assigned_user_id = $2 OR t.created_by_user_id = $2)
+           ORDER BY t.last_message_at DESC`,
+          [req.employerId, req.userId]
+        );
 
     res.json(result.rows);
   } catch (error) {
@@ -106,49 +215,66 @@ router.get('/users', authMiddleware, async (req, res) => {
   const onlineUsers = req.app.locals.onlineUsers || new Map();
 
   try {
-    const usersResult = await db.query(
-      `SELECT u.id, u.first_name, u.last_name, u.email, u.department, u.designation,
-              u.is_active, u.last_login,
-              t.id as thread_id, t.last_message_at,
-              m.message as last_message,
-              COALESCE(unread.unread_count, 0)::int as unread_count
-       FROM users u
-       LEFT JOIN user_chat_threads t
-         ON t.employer_id = u.employer_id
-        AND (u.id = t.participant_one_id OR u.id = t.participant_two_id)
-        AND ($2 = t.participant_one_id OR $2 = t.participant_two_id OR $2 = $1)
-       LEFT JOIN LATERAL (
-         SELECT message FROM user_chat_messages
-         WHERE thread_id = t.id
-         ORDER BY created_at DESC
-         LIMIT 1
-       ) m ON true
-       LEFT JOIN LATERAL (
-         SELECT COUNT(*) as unread_count
-         FROM user_chat_messages um
-         WHERE um.thread_id = t.id
-           AND um.employer_id = $1
-           AND um.sender_id != $2
-           AND um.created_at > COALESCE(
-             CASE
-               WHEN t.participant_one_id = $2 THEN t.participant_one_last_read_at
-               WHEN t.participant_two_id = $2 THEN t.participant_two_last_read_at
-               ELSE NULL
-             END,
-             TIMESTAMP '1970-01-01'
-           )
-       ) unread ON true
-       WHERE u.employer_id = $1 AND u.is_active = true AND u.id != $2
-       ORDER BY COALESCE(t.last_message_at, u.created_at) DESC`,
-      [req.employerId, req.userId]
-    );
+    const platformWide = isPlatformWide(req);
+    if (!platformWide && !req.employerId) {
+      return res.status(400).json({ error: 'Company context required' });
+    }
+
+    const usersResult = platformWide
+      ? await db.query(
+          `SELECT u.id, u.first_name, u.last_name, u.email, u.department, u.designation,
+                  u.is_active, u.last_login, e.company_name,
+                  NULL::uuid as thread_id, NULL::timestamptz as last_message_at,
+                  NULL::text as last_message,
+                  0::int as unread_count
+           FROM users u
+           JOIN employers e ON e.id = u.employer_id
+           WHERE u.is_active = true
+           ORDER BY u.created_at DESC`
+        )
+      : await db.query(
+          `SELECT u.id, u.first_name, u.last_name, u.email, u.department, u.designation,
+                  u.is_active, u.last_login,
+                  t.id as thread_id, t.last_message_at,
+                  m.message as last_message,
+                  COALESCE(unread.unread_count, 0)::int as unread_count
+           FROM users u
+           LEFT JOIN user_chat_threads t
+             ON t.employer_id = u.employer_id
+            AND (u.id = t.participant_one_id OR u.id = t.participant_two_id)
+            AND ($2 = t.participant_one_id OR $2 = t.participant_two_id OR $2 = $1)
+           LEFT JOIN LATERAL (
+             SELECT message FROM user_chat_messages
+             WHERE thread_id = t.id
+             ORDER BY created_at DESC
+             LIMIT 1
+           ) m ON true
+           LEFT JOIN LATERAL (
+             SELECT COUNT(*) as unread_count
+             FROM user_chat_messages um
+             WHERE um.thread_id = t.id
+               AND um.employer_id = $1
+               AND um.sender_id != $2
+               AND um.created_at > COALESCE(
+                 CASE
+                   WHEN t.participant_one_id = $2 THEN t.participant_one_last_read_at
+                   WHEN t.participant_two_id = $2 THEN t.participant_two_last_read_at
+                   ELSE NULL
+                 END,
+                 TIMESTAMP '1970-01-01'
+               )
+           ) unread ON true
+           WHERE u.employer_id = $1 AND u.is_active = true AND u.id != $2
+           ORDER BY COALESCE(t.last_message_at, u.created_at) DESC`,
+          [req.employerId, req.userId]
+        );
 
     const rows = usersResult.rows.map((user) => ({
       ...user,
       online: onlineUsers.has(user.id),
     }));
 
-    if (req.userId !== req.employerId) {
+    if (!platformWide && req.userId !== req.employerId) {
       const owner = await getChatUser(db, req.employerId, req.employerId);
       if (owner) {
         const pair = orderedParticipants(req.userId, req.employerId);
@@ -202,6 +328,17 @@ router.get('/unread-count', authMiddleware, async (req, res) => {
   const db = req.app.locals.db;
 
   try {
+    // Super-admin uses a synthetic userId ("super-admin") that is not a UUID.
+    // When a tenant is selected, treat them as the company owner for unread counts.
+    const actorId =
+      req.isSuperAdmin || req.userId === 'super-admin'
+        ? req.employerId
+        : req.userId;
+
+    if (!req.employerId || !actorId) {
+      return res.json({ unread_count: 0 });
+    }
+
     const result = await db.query(
       `SELECT COALESCE(SUM(thread_counts.unread_count), 0)::int as unread_count
        FROM (
@@ -223,7 +360,7 @@ router.get('/unread-count', authMiddleware, async (req, res) => {
            AND ($2 = t.participant_one_id OR $2 = t.participant_two_id OR $2 = $1)
          GROUP BY t.id
        ) thread_counts`,
-      [req.employerId, req.userId]
+      [req.employerId, actorId]
     );
 
     res.json({ unread_count: result.rows[0]?.unread_count || 0 });
@@ -242,16 +379,23 @@ router.post('/user-threads', authMiddleware, async (req, res) => {
     if (!recipientUserId) {
       return res.status(400).json({ error: 'recipientUserId is required' });
     }
-    if (recipientUserId === req.userId) {
+
+    const ctx = await resolveChatContext(db, req, { recipientUserId });
+    if (!ctx.ok) {
+      return res.status(ctx.status).json({ error: ctx.error });
+    }
+
+    if (recipientUserId === ctx.actorId || recipientUserId === req.userId) {
       return res.status(400).json({ error: 'Cannot chat with yourself' });
     }
 
-    const recipient = await getChatUser(db, recipientUserId, req.employerId);
+    const recipient = await getChatUser(db, recipientUserId, ctx.employerId);
     if (!recipient) {
       return res.status(404).json({ error: 'User not found' });
     }
 
-    const pair = orderedParticipants(req.userId, recipientUserId);
+    // SA uses company owner UUID as participant (req.userId is "super-admin", not a UUID)
+    const pair = orderedParticipants(ctx.actorId, recipientUserId);
     const result = await db.query(
       `INSERT INTO user_chat_threads (
          employer_id, participant_one_id, participant_two_id, last_message_at, created_at, updated_at
@@ -260,12 +404,12 @@ router.post('/user-threads', authMiddleware, async (req, res) => {
        ON CONFLICT (employer_id, participant_one_id, participant_two_id)
        DO UPDATE SET updated_at = NOW()
        RETURNING *`,
-      [req.employerId, pair[0], pair[1]]
+      [ctx.employerId, pair[0], pair[1]]
     );
 
     const payload = { thread: result.rows[0], recipient };
     io?.to(`user:${recipientUserId}`).emit('user-thread:created', payload);
-    io?.to(`user:${req.userId}`).emit('user-thread:created', payload);
+    io?.to(`user:${ctx.actorId}`).emit('user-thread:created', payload);
     res.status(201).json(payload);
   } catch (error) {
     console.error('Create user chat thread error:', error);
@@ -277,7 +421,12 @@ router.get('/user-threads/:threadId/messages', authMiddleware, async (req, res) 
   const db = req.app.locals.db;
 
   try {
-    const thread = await getUserChatThreadAccess(db, req.params.threadId, req);
+    const ctx = await resolveChatContext(db, req, { threadId: req.params.threadId });
+    if (!ctx.ok) {
+      return res.status(ctx.status).json({ error: ctx.error });
+    }
+
+    const thread = await getUserChatThreadAccess(db, req.params.threadId, req, ctx.employerId);
     if (!thread) {
       return res.status(404).json({ error: 'Chat thread not found' });
     }
@@ -287,7 +436,7 @@ router.get('/user-threads/:threadId/messages', authMiddleware, async (req, res) 
        FROM user_chat_messages
        WHERE thread_id = $1 AND employer_id = $2
        ORDER BY created_at ASC`,
-      [req.params.threadId, req.employerId]
+      [req.params.threadId, ctx.employerId]
     );
 
     res.json(result.rows);
@@ -301,21 +450,26 @@ router.post('/user-threads/:threadId/read', authMiddleware, async (req, res) => 
   const db = req.app.locals.db;
 
   try {
-    const thread = await getUserChatThreadAccess(db, req.params.threadId, req);
+    const ctx = await resolveChatContext(db, req, { threadId: req.params.threadId });
+    if (!ctx.ok) {
+      return res.status(ctx.status).json({ error: ctx.error });
+    }
+
+    const thread = await getUserChatThreadAccess(db, req.params.threadId, req, ctx.employerId);
     if (!thread) {
       return res.status(404).json({ error: 'Chat thread not found' });
     }
 
-    const readColumn = thread.participant_one_id === req.userId
+    const readColumn = thread.participant_one_id === ctx.actorId
       ? 'participant_one_last_read_at'
-      : thread.participant_two_id === req.userId
+      : thread.participant_two_id === ctx.actorId
         ? 'participant_two_last_read_at'
         : null;
 
     if (readColumn) {
       await db.query(
         `UPDATE user_chat_threads SET ${readColumn} = NOW(), updated_at = NOW() WHERE id = $1 AND employer_id = $2`,
-        [req.params.threadId, req.employerId]
+        [req.params.threadId, ctx.employerId]
       );
     }
 
@@ -339,12 +493,17 @@ router.post('/user-threads/:threadId/messages', authMiddleware, async (req, res)
       return res.status(400).json({ error: 'Message is required' });
     }
 
-    const thread = await getUserChatThreadAccess(db, req.params.threadId, req);
+    const ctx = await resolveChatContext(db, req, { threadId: req.params.threadId });
+    if (!ctx.ok) {
+      return res.status(ctx.status).json({ error: ctx.error });
+    }
+
+    const thread = await getUserChatThreadAccess(db, req.params.threadId, req, ctx.employerId);
     if (!thread) {
       return res.status(404).json({ error: 'Chat thread not found' });
     }
 
-    const actor = await getActor(db, req.userId, req.employerId);
+    const actor = await getActor(db, req.userId, ctx.employerId);
     const result = await db.query(
       `INSERT INTO user_chat_messages (
          thread_id, employer_id, sender_id, sender_name, sender_email, message, metadata, created_at
@@ -353,8 +512,8 @@ router.post('/user-threads/:threadId/messages', authMiddleware, async (req, res)
        RETURNING *`,
       [
         req.params.threadId,
-        req.employerId,
-        req.userId,
+        ctx.employerId,
+        ctx.actorId,
         actor.actorName,
         actor.actorEmail,
         cleanMessage || 'Voice message',
@@ -418,7 +577,15 @@ router.post('/user-threads/:threadId/candidates', authMiddleware, async (req, re
       return res.status(400).json({ error: 'Select at least one candidate' });
     }
 
-    const thread = await getUserChatThreadAccess(db, req.params.threadId, req);
+    const ctx = await resolveChatContext(db, req, {
+      threadId: req.params.threadId,
+      applicationIds: ids,
+    });
+    if (!ctx.ok) {
+      return res.status(ctx.status).json({ error: ctx.error });
+    }
+
+    const thread = await getUserChatThreadAccess(db, req.params.threadId, req, ctx.employerId);
     if (!thread) {
       return res.status(404).json({ error: 'Chat thread not found' });
     }
@@ -431,14 +598,14 @@ router.post('/user-threads/:threadId/candidates', authMiddleware, async (req, re
        LEFT JOIN candidates c ON a.candidate_id = c.id
        LEFT JOIN jobs j ON a.job_id = j.id
        WHERE a.id = ANY($1::uuid[]) AND j.employer_id = $2`,
-      [ids, req.employerId]
+      [ids, ctx.employerId]
     );
 
     if (candidates.rows.length === 0) {
       return res.status(404).json({ error: 'No candidates found' });
     }
 
-    const actor = await getActor(db, req.userId, req.employerId);
+    const actor = await getActor(db, req.userId, ctx.employerId);
     const candidateNames = candidates.rows.map((candidate) => `${candidate.first_name || ''} ${candidate.last_name || ''}`.trim() || candidate.email).join(', ');
     const result = await db.query(
       `INSERT INTO user_chat_messages (
@@ -448,8 +615,8 @@ router.post('/user-threads/:threadId/candidates', authMiddleware, async (req, re
        RETURNING *`,
       [
         req.params.threadId,
-        req.employerId,
-        req.userId,
+        ctx.employerId,
+        ctx.actorId,
         actor.actorName,
         actor.actorEmail,
         `Shared candidate${candidates.rows.length > 1 ? 's' : ''}: ${candidateNames}`,
@@ -483,6 +650,14 @@ router.post('/tag', authMiddleware, async (req, res) => {
       return res.status(400).json({ error: 'applicationId and assignedUserId are required' });
     }
 
+    const ctx = await resolveChatContext(db, req, {
+      recipientUserId: assignedUserId,
+      applicationId,
+    });
+    if (!ctx.ok) {
+      return res.status(ctx.status).json({ error: ctx.error });
+    }
+
     const appResult = await db.query(
       `SELECT a.id, a.candidate_id, c.first_name, c.last_name, c.email,
               c.resume_url, c.skills, c.experience_years, j.title as job_title
@@ -490,7 +665,7 @@ router.post('/tag', authMiddleware, async (req, res) => {
        LEFT JOIN candidates c ON a.candidate_id = c.id
        LEFT JOIN jobs j ON a.job_id = j.id
        WHERE a.id = $1 AND j.employer_id = $2`,
-      [applicationId, req.employerId]
+      [applicationId, ctx.employerId]
     );
 
     if (appResult.rows.length === 0) {
@@ -501,7 +676,7 @@ router.post('/tag', authMiddleware, async (req, res) => {
       `SELECT id, first_name, last_name, email
        FROM users
        WHERE id = $1 AND employer_id = $2 AND is_active = true`,
-      [assignedUserId, req.employerId]
+      [assignedUserId, ctx.employerId]
     );
 
     if (userResult.rows.length === 0) {
@@ -509,7 +684,7 @@ router.post('/tag', authMiddleware, async (req, res) => {
     }
 
     const application = appResult.rows[0];
-    const actor = await getActor(db, req.userId, req.employerId);
+    const actor = await getActor(db, req.userId, ctx.employerId);
     const title = `${application.first_name || ''} ${application.last_name || ''}`.trim() || application.email || 'Candidate';
 
     const threadResult = await db.query(
@@ -521,7 +696,7 @@ router.post('/tag', authMiddleware, async (req, res) => {
        ON CONFLICT (employer_id, application_id, assigned_user_id)
        DO UPDATE SET updated_at = NOW(), last_message_at = NOW()
        RETURNING *`,
-      [req.employerId, applicationId, application.candidate_id, assignedUserId, req.userId, title]
+      [ctx.employerId, applicationId, application.candidate_id, assignedUserId, ctx.actorId, title]
     );
 
     const thread = threadResult.rows[0];
@@ -534,8 +709,8 @@ router.post('/tag', authMiddleware, async (req, res) => {
        RETURNING *`,
       [
         thread.id,
-        req.employerId,
-        req.userId,
+        ctx.employerId,
+        ctx.actorId,
         actor.actorName,
         actor.actorEmail,
         message || defaultMessage,
@@ -547,7 +722,7 @@ router.post('/tag', authMiddleware, async (req, res) => {
 
     const payload = { thread, message: messageResult.rows[0], application };
     io?.to(`user:${assignedUserId}`).emit('thread:created', payload);
-    io?.to(`user:${req.userId}`).emit('thread:created', payload);
+    io?.to(`user:${ctx.actorId}`).emit('thread:created', payload);
     emitThread(io, thread.id, 'message:new', messageResult.rows[0]);
 
     res.status(201).json(payload);

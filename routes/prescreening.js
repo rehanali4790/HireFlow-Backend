@@ -2,7 +2,25 @@ const express = require('express');
 const authMiddleware = require('../middleware/auth');
 const { checkPermission } = require('../middleware/permissions');
 const { getActor } = require('../middleware/audit-log');
+const { isPlatformWide } = require('../utils/platform-scope');
 const router = express.Router();
+
+async function assertJobAccess(db, req, jobId) {
+  if (isPlatformWide(req)) {
+    const result = await db.query('SELECT id, employer_id FROM jobs WHERE id = $1', [jobId]);
+    return result.rows[0] || null;
+  }
+
+  if (!req.employerId) {
+    return null;
+  }
+
+  const result = await db.query(
+    'SELECT id, employer_id FROM jobs WHERE id = $1 AND employer_id = $2',
+    [jobId, req.employerId]
+  );
+  return result.rows[0] || null;
+}
 
 async function getQuestionsForEmployer(db, employerId) {
   const result = await db.query(
@@ -80,6 +98,10 @@ router.get('/', authMiddleware, checkPermission('jobs', 'read'), async (req, res
   const db = req.app.locals.db;
 
   try {
+    if (!req.employerId) {
+      return res.status(400).json({ error: 'Company context required' });
+    }
+
     const questions = await getQuestionsForEmployer(db, req.employerId);
     res.json({ questions });
   } catch (error) {
@@ -97,8 +119,15 @@ router.post('/', authMiddleware, checkPermission('jobs', 'write'), async (req, r
     return res.status(400).json({ error: 'Question text is required' });
   }
 
+  if (!req.employerId) {
+    return res.status(400).json({ error: 'Company context required' });
+  }
+
   try {
-    const actor = await getActor(db, req.userId, req.employerId);
+    const skipActorHistory = Boolean(req.isSuperAdmin || req.userType === 'super_admin');
+    const actor = skipActorHistory
+      ? { actorName: null, actorEmail: null }
+      : await getActor(db, req.userId, req.employerId);
     const countResult = await db.query(
       `SELECT COUNT(*)::int AS count FROM prescreening_questions
        WHERE employer_id = $1 OR is_predefined = true`,
@@ -158,17 +187,14 @@ router.get('/job/:jobId', authMiddleware, checkPermission('jobs', 'read'), async
   const db = req.app.locals.db;
 
   try {
-    const jobCheck = await db.query(
-      'SELECT id FROM jobs WHERE id = $1 AND employer_id = $2',
-      [req.params.jobId, req.employerId]
-    );
-
-    if (jobCheck.rows.length === 0) {
+    const job = await assertJobAccess(db, req, req.params.jobId);
+    if (!job) {
       return res.status(404).json({ error: 'Job not found or unauthorized' });
     }
 
+    const employerId = req.employerId || job.employer_id;
     const [questions, settings] = await Promise.all([
-      getQuestionsForEmployer(db, req.employerId),
+      getQuestionsForEmployer(db, employerId),
       getJobPrescreeningSettings(db, req.params.jobId),
     ]);
 
@@ -185,12 +211,8 @@ router.put('/job/:jobId', authMiddleware, checkPermission('jobs', 'edit'), async
   const { settings } = req.body;
 
   try {
-    const jobCheck = await db.query(
-      'SELECT id FROM jobs WHERE id = $1 AND employer_id = $2',
-      [req.params.jobId, req.employerId]
-    );
-
-    if (jobCheck.rows.length === 0) {
+    const job = await assertJobAccess(db, req, req.params.jobId);
+    if (!job) {
       return res.status(404).json({ error: 'Job not found or unauthorized' });
     }
 
