@@ -1,42 +1,43 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const { Pool } = require('pg');
 const http = require('http');
 const { Server } = require('socket.io');
+const { createPool, isProduction } = require('./config/database');
 const { getPermissionResources } = require('./config/permission-catalog');
 const { auditLogMiddleware } = require('./middleware/audit-log');
 const { verifyAuthToken } = require('./utils/auth-token');
-const { runSqlMigrations } = require('./scripts/sql-migrations');
+const { bootstrapDatabase } = require('./scripts/bootstrap-database');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+const HOST = process.env.HOST || '0.0.0.0';
 const server = http.createServer(app);
+
+function getAllowedOrigins() {
+  const raw = process.env.CORS_ORIGIN || process.env.APP_URL || '';
+  return raw
+    .split(',')
+    .map((origin) => origin.trim())
+    .filter(Boolean);
+}
+
+const allowedOrigins = getAllowedOrigins();
+
 const io = new Server(server, {
   cors: {
-    origin: true,
+    origin: allowedOrigins.length > 0 ? allowedOrigins : true,
     credentials: true,
   },
 });
 const onlineUsers = new Map();
 
-// Database connection
-const pool = new Pool({
-  host: process.env.DB_HOST,
-  port: process.env.DB_PORT,
-  database: process.env.DB_NAME,
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
-});
+const pool = createPool();
 
-async function ensurePgcryptoExtension() {
-  try {
-    await pool.query('CREATE EXTENSION IF NOT EXISTS pgcrypto');
-  } catch (err) {
-    // Safe to ignore if another connection created the extension first.
-    if (err.code !== '23505') throw err;
-  }
+if (isProduction()) {
+  app.set('trust proxy', 1);
 }
+
 
 async function ensurePipelineSkipColumns() {
   await pool.query(`
@@ -293,11 +294,7 @@ async function ensureCandidateChatTables() {
 
 async function initializeDatabase() {
   try {
-    await pool.query('SELECT NOW()');
-    console.log('✅ Database connected successfully');
-
-    await ensurePgcryptoExtension();
-    await runSqlMigrations(pool, {
+    await bootstrapDatabase(pool, {
       log: (message) => console.log(message),
       warn: (message) => console.warn(message),
     });
@@ -317,8 +314,14 @@ initializeDatabase();
 
 // Middleware
 app.use(cors({
-  origin: '*', // Allow all origins in development
-  credentials: false,
+  origin: (origin, callback) => {
+    if (!origin || allowedOrigins.length === 0 || allowedOrigins.includes(origin)) {
+      callback(null, true);
+      return;
+    }
+    callback(new Error('Not allowed by CORS'));
+  },
+  credentials: allowedOrigins.length > 0,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'x-employer-id', 'x-tenant-id', 'x-user-id', 'ngrok-skip-browser-warning'],
 }));
@@ -368,13 +371,23 @@ app.use('/api/chats', require('./routes/chats'));
 // Permissions endpoint
 app.get('/api/permissions/me', authMiddleware, getUserPermissions);
 
-// Health check
-app.get('/api/health', (req, res) => {
-  res.json({
-    status: 'ok',
-    message: 'HireFlow API is running',
-    timestamp: new Date().toISOString(),
-  });
+// Health check (used by Railway)
+app.get('/api/health', async (req, res) => {
+  try {
+    await pool.query('SELECT 1');
+    res.json({
+      status: 'ok',
+      message: 'HireFlow API is running',
+      environment: isProduction() ? 'production' : 'development',
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    res.status(503).json({
+      status: 'error',
+      message: 'Database unavailable',
+      timestamp: new Date().toISOString(),
+    });
+  }
 });
 
 io.use((socket, next) => {
@@ -423,7 +436,7 @@ app.use((err, req, res, next) => {
 });
 
 // Start server
-server.listen(PORT, () => {
-  console.log(`🚀 Server running on http://localhost:${PORT}`);
-  console.log(`📊 Health check: http://localhost:${PORT}/api/health`);
+server.listen(PORT, HOST, () => {
+  console.log(`🚀 Server running on http://${HOST}:${PORT}`);
+  console.log(`📊 Health check: http://${HOST}:${PORT}/api/health`);
 });

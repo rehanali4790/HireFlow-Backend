@@ -1,15 +1,15 @@
 require('dotenv').config();
-const { Client } = require('pg');
+const { createClient } = require('../config/database');
 
 async function createDatabase() {
+  if (process.env.DATABASE_URL) {
+    console.log('ℹ️ DATABASE_URL is set — Railway/managed Postgres already provides a database.');
+    console.log('   Run "npm run db:bootstrap" to create tables and apply migrations.');
+    return;
+  }
+
   // Connect to the default 'postgres' database first
-  const client = new Client({
-    host: process.env.DB_HOST,
-    port: process.env.DB_PORT,
-    database: 'postgres', // Connect to default database
-    user: process.env.DB_USER,
-    password: process.env.DB_PASSWORD,
-  });
+  const client = createClient({ database: 'postgres' });
 
   try {
     await client.connect();
@@ -29,7 +29,7 @@ async function createDatabase() {
       console.log(`✅ Database '${process.env.DB_NAME}' created successfully!`);
     }
     
-    console.log('\n📝 Next step: Run "npm run setup-db" to create tables');
+    console.log('\n📝 Next step: Run "npm run db:setup" to create tables');
     
   } catch (error) {
     console.error('❌ Error:', error.message);

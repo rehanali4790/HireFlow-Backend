@@ -1,9 +1,9 @@
 const express = require('express');
 const router = express.Router();
-const OpenAI = require('openai');
 const multer = require('multer');
 const fs = require('fs');
 const path = require('path');
+const { getOpenAI } = require('../utils/openai-client');
 const {
   cleanTranscription,
   isLikelyHallucination,
@@ -11,10 +11,6 @@ const {
   mapLanguagePreference,
   getAverageNoSpeechProb,
 } = require('../utils/transcription');
-
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
 
 const upload = multer({
   dest: 'uploads/audio/',
@@ -52,7 +48,7 @@ async function transcribeInterviewAudio(tempFilePath, languagePreference = 'both
     request.language = whisperLanguage;
   }
 
-  const transcription = await openai.audio.transcriptions.create(request);
+  const transcription = await getOpenAI().audio.transcriptions.create(request);
   const avgNoSpeech = getAverageNoSpeechProb(transcription.segments || []);
 
   if (avgNoSpeech > 0.55) {
@@ -89,7 +85,7 @@ router.post('/tts', async (req, res) => {
       return res.status(400).json({ error: 'Text is required' });
     }
 
-    const mp3 = await openai.audio.speech.create({
+    const mp3 = await getOpenAI().audio.speech.create({
       model: 'tts-1',
       voice: 'alloy',
       input: text,

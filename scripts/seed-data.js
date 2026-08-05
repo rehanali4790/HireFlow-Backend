@@ -1,15 +1,9 @@
 require('dotenv').config();
-const { Pool } = require('pg');
+const { createPool } = require('../config/database');
 const bcrypt = require('bcrypt');
 
 async function seedData() {
-  const pool = new Pool({
-    host: process.env.DB_HOST,
-    port: process.env.DB_PORT,
-    database: process.env.DB_NAME,
-    user: process.env.DB_USER,
-    password: process.env.DB_PASSWORD,
-  });
+  const pool = createPool();
 
   try {
     console.log('🔄 Seeding demo data...');

@@ -257,3 +257,7 @@ curl -X POST http://localhost:3001/api/auth/login \
 ## License
 
 MIT
+
+## Railway Deployment
+
+See [RAILWAY.md](./RAILWAY.md) for deploying to Railway with PostgreSQL.

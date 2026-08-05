@@ -1,8 +1,4 @@
-const OpenAI = require('openai');
-
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
+const { getOpenAI } = require('../utils/openai-client');
 
 /**
  * Analyze resume and score candidate against job requirements
@@ -147,7 +143,7 @@ IMPORTANT NOTES:
 - "education_relevance" should explain if the degree is relevant to the job (e.g., "Highly relevant - Computer Science degree for Backend role")
 `;
 
-  const response = await openai.chat.completions.create({
+  const response = await getOpenAI().chat.completions.create({
     model: 'gpt-4o-mini',
     messages: [
       { 
@@ -224,7 +220,7 @@ Respond ONLY with JSON:
   "assessment": "not_qualified" | "qualified" | "highly_qualified" | "needs_more_info"
 }`;
 
-    const evalResponse = await openai.chat.completions.create({
+    const evalResponse = await getOpenAI().chat.completions.create({
       model: 'gpt-4o-mini',
       messages: [
         { role: 'system', content: 'You are an expert interviewer making decisions about interview continuation.' },
@@ -300,7 +296,7 @@ CRITICAL RULES:
 5. Keep questions conversational and professional
 6. Avoid generic questions - make them specific to this role and their background`;
 
-  const response = await openai.chat.completions.create({
+  const response = await getOpenAI().chat.completions.create({
     model: 'gpt-4o-mini',
     messages: [
       { role: 'system', content: systemPrompt },
@@ -369,7 +365,7 @@ Respond ONLY with valid JSON in this exact format:
   "recommendation": "hire"
 }`;
 
-  const response = await openai.chat.completions.create({
+  const response = await getOpenAI().chat.completions.create({
     model: 'gpt-4o-mini',
     messages: [
       { role: 'system', content: 'You are an expert technical interviewer evaluating candidates. Respond only with valid JSON.' },
@@ -397,7 +393,7 @@ Respond ONLY with valid JSON in this exact format:
 }
 
 async function generateJobContent(prompt) {
-  const response = await openai.chat.completions.create({
+  const response = await getOpenAI().chat.completions.create({
     model: 'gpt-4o-mini',
     messages: [
       {
