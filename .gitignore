@@ -26,3 +26,7 @@ Thumbs.db
 # Uploads (keep directory structure but ignore uploaded files)
 uploads/pictures/*
 !uploads/pictures/.gitkeep
+
+
+uploads/interview-videos/
+uploads/resumes/
