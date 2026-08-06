@@ -18,10 +18,7 @@ function getJobStatusLabel(status) {
   return JOB_STATUS_LABELS[key] || key || 'Unknown';
 }
 
-function getAppBaseUrl() {
-  const base = String(process.env.APP_URL || process.env.FRONTEND_URL || 'http://localhost:5173').trim();
-  return base.replace(/\/+$/, '');
-}
+const { getAppUrl } = require('../config/app');
 
 function mapExternalJob(row) {
   const jobStatus = String(row.status || '').toLowerCase();
@@ -40,7 +37,7 @@ function mapExternalJob(row) {
     min_salary: row.salary_min != null ? Number(row.salary_min) : null,
     max_salary: row.salary_max != null ? Number(row.salary_max) : null,
     currency: row.salary_currency || null,
-    apply_link: `${getAppBaseUrl()}/apply/${row.id}`,
+    apply_link: `${getAppUrl()}/apply/${row.id}`,
     job_status: jobStatus,
     job_status_label: getJobStatusLabel(jobStatus),
     status: jobStatus,

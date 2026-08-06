@@ -3,6 +3,7 @@ const authMiddleware = require('../middleware/auth');
 const { checkPermission } = require('../middleware/permissions');
 const { getActor, logActivity } = require('../middleware/audit-log');
 const { isPlatformWide, resolveEmployerIdForApplication } = require('../utils/platform-scope');
+const { getAppUrl } = require('../config/app');
 const router = express.Router();
 const { v4: uuidv4 } = require('uuid');
 
@@ -630,7 +631,7 @@ router.post('/send-invitation', authMiddleware, checkPermission('ai_interviews',
     }
     
     // Generate interview link
-    const interviewLink = `${process.env.APP_URL}/interview/${interviewToken}`;
+    const interviewLink = `${getAppUrl()}/interview/${interviewToken}`;
     console.log('🔗 Interview link generated:', interviewLink);
     
     // Format dates for email

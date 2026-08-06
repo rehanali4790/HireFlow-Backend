@@ -3,6 +3,7 @@ const authMiddleware = require('../middleware/auth');
 const { checkPermission } = require('../middleware/permissions');
 const { getActor, logActivity } = require('../middleware/audit-log');
 const { isPlatformWide, resolveEmployerIdForApplication } = require('../utils/platform-scope');
+const { getAppUrl } = require('../config/app');
 const router = express.Router();
 
 async function applyApplicationUpdater(db, req, applicationId, employerIdOverride = null) {
@@ -706,7 +707,7 @@ router.post('/send-invitation', authMiddleware, checkPermission('tests', 'write'
     }
     
     // Generate test link
-    const testLink = `${process.env.APP_URL}/test/${test.id}?application=${applicationId}`;
+    const testLink = `${getAppUrl()}/test/${test.id}?application=${applicationId}`;
     
     // Parse questions to get count
     const questions = typeof test.questions === 'string' ? JSON.parse(test.questions) : test.questions || [];

@@ -4,6 +4,7 @@ const cors = require('cors');
 const http = require('http');
 const { Server } = require('socket.io');
 const { createPool, isProduction, getDatabaseTarget } = require('./config/database');
+const { getCorsOrigins } = require('./config/app');
 const { getPermissionResources } = require('./config/permission-catalog');
 const { auditLogMiddleware } = require('./middleware/audit-log');
 const { verifyAuthToken } = require('./utils/auth-token');
@@ -14,15 +15,7 @@ const PORT = process.env.PORT || 3001;
 const HOST = process.env.HOST || '0.0.0.0';
 const server = http.createServer(app);
 
-function getAllowedOrigins() {
-  const raw = process.env.CORS_ORIGIN || process.env.APP_URL || '';
-  return raw
-    .split(',')
-    .map((origin) => origin.trim())
-    .filter(Boolean);
-}
-
-const allowedOrigins = getAllowedOrigins();
+const allowedOrigins = getCorsOrigins();
 
 const io = new Server(server, {
   cors: {
