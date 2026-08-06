@@ -3,7 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const http = require('http');
 const { Server } = require('socket.io');
-const { createPool, isProduction } = require('./config/database');
+const { createPool, isProduction, getDatabaseTarget } = require('./config/database');
 const { getPermissionResources } = require('./config/permission-catalog');
 const { auditLogMiddleware } = require('./middleware/audit-log');
 const { verifyAuthToken } = require('./utils/auth-token');
@@ -293,20 +293,35 @@ async function ensureCandidateChatTables() {
 }
 
 async function initializeDatabase() {
-  try {
-    await bootstrapDatabase(pool, {
-      log: (message) => console.log(message),
-      warn: (message) => console.warn(message),
-    });
-    await ensurePipelineSkipColumns();
-    await ensureTestAttemptsColumns();
-    await ensurePermissionCatalog();
-    await ensureActivityLog();
-    await ensureFinalScoringMetadata();
-    await ensureTenantUpdateMetadata();
-    await ensureCandidateChatTables();
-  } catch (err) {
-    console.error('❌ Database initialization failed:', err.message);
+  const maxAttempts = 8;
+  const delayMs = 3000;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      console.log(`🔄 Connecting to database (${getDatabaseTarget()}) [attempt ${attempt}/${maxAttempts}]...`);
+      await bootstrapDatabase(pool, {
+        log: (message) => console.log(message),
+        warn: (message) => console.warn(message),
+      });
+      await ensurePipelineSkipColumns();
+      await ensureTestAttemptsColumns();
+      await ensurePermissionCatalog();
+      await ensureActivityLog();
+      await ensureFinalScoringMetadata();
+      await ensureTenantUpdateMetadata();
+      await ensureCandidateChatTables();
+      return;
+    } catch (err) {
+      const details = err?.message || err?.code || String(err);
+      console.error(`❌ Database initialization failed (attempt ${attempt}/${maxAttempts}): ${details}`);
+
+      if (attempt === maxAttempts) {
+        console.error('❌ Giving up on database initialization. Check DATABASE_URL is linked to this Railway service.');
+        return;
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
   }
 }
 

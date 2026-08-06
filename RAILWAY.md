@@ -10,6 +10,15 @@
 1. **Create a new Railway project** and add a **PostgreSQL** database.
 2. **Create a new service** from your `HireFlow-Backend` repo (or subdirectory if monorepo).
 3. **Link the Postgres plugin** to the backend service — Railway injects `DATABASE_URL` automatically.
+
+   In the backend service **Variables** tab, add:
+
+   | Variable | Value |
+   |----------|-------|
+   | `DATABASE_URL` | `${{Postgres.DATABASE_URL}}` |
+
+   Replace `Postgres` with your database service name if different. Use the **internal** URL (`postgres.railway.internal`) — do not paste the public proxy URL unless you also set `DB_SSL=true`.
+
 4. **Set environment variables** in the Railway dashboard:
 
 | Variable | Required | Description |
@@ -26,7 +35,9 @@
 | `SUPER_ADMIN_EMAIL` | No | Platform super admin login |
 | `SUPER_ADMIN_PASSWORD` | No | |
 
-`DATABASE_URL`, `PORT`, and `RAILWAY_ENVIRONMENT` are set automatically by Railway.
+`DATABASE_URL`, `PORT`, and `RAILWAY_ENVIRONMENT` are set automatically by Railway when Postgres is linked.
+
+> **Troubleshooting:** If you see `Database initialization failed` with an empty message, the backend service likely does not have `DATABASE_URL` set. Link Postgres or add `DATABASE_URL=${{Postgres.DATABASE_URL}}` manually.
 
 5. **Deploy** — Railway runs `npm install` then `npm start`.
 
