@@ -351,7 +351,10 @@ app.use('/uploads', express.static('uploads'));
 const authMiddleware = require('./middleware/auth');
 const { getUserPermissions } = require('./middleware/permissions');
 
-app.use('/api/auth', require('./routes/auth'));
+const authRouter = require('./routes/auth');
+
+app.use('/api/auth', authRouter);
+app.use('/auth', authRouter);
 app.use('/api/employers', require('./routes/employers'));
 app.use('/api/users', require('./routes/users'));
 app.use('/api/roles', require('./routes/roles'));
